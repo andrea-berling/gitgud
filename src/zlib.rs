@@ -122,3 +122,39 @@ impl TryFrom<&[u8]> for Stream {
         })
     }
 }
+
+fn adler32(bytes: &[u8]) -> [u8; 4] {
+    const MOD_ADLER: u32 = 65521;
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for &byte in bytes {
+        s1 = (s1 + byte as u32) % MOD_ADLER;
+        s2 = (s2 + s1) % MOD_ADLER;
+    }
+    ((s2 << 16) | s1).to_be_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adler32_empty() {
+        let input = b"";
+        let checksum = adler32(input);
+        assert_eq!(checksum, [0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_adler32_wikipedia() {
+        let input = b"Wikipedia";
+        let checksum = adler32(input);
+        assert_eq!(checksum, [0x11, 0xE6, 0x03, 0x98]);
+    }
+
+    #[test]
+    fn test_adler32_long() {
+        let input = vec![b'a'; 1024];
+        let checksum = adler32(&input);
+        assert_eq!([0xf3, 0x78, 0x84, 0x10], checksum);
+    }
+}
