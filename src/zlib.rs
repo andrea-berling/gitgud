@@ -1,8 +1,9 @@
-use std::{cmp::max, fmt::Display};
+use std::fmt::Display;
 
 use anyhow::{bail, ensure, Context};
 
 const COMPRESSION_LEVEL_MASK: u8 = 0x3;
+const BLOCK_TYPE_MASK: u8 = 0x3;
 const DEFLATE_IDENTIFIER: u8 = 0x8;
 
 #[derive(Debug)]
@@ -60,7 +61,23 @@ pub struct Stream {
     flags_check_bits: u8,
     compression_level: CompressionLevel,
     compressed_data: Vec<u8>,
-    checksum: [u8; 4],
+}
+
+impl Stream {
+    pub fn inflate(&self) -> anyhow::Result<Vec<u8>> {
+        let (result, parsed_bytes) =
+            inflate(&self.compressed_data).context("inflating the compressed data")?;
+        ensure!(
+            self.compressed_data.len() - parsed_bytes >= 4,
+            "missing ADLER-32 checksum"
+        );
+        let checksum: [u8; 4] = self.compressed_data[parsed_bytes..][..4].try_into()?;
+        ensure!(
+            adler32(&result) == checksum,
+            "invalid checksum after the compressed data"
+        );
+        Ok(result)
+    }
 }
 
 impl Display for Stream {
@@ -75,12 +92,7 @@ impl Display for Stream {
         )?;
         writeln!(f, "Compression level: {:?}", self.compression_level)?;
         writeln!(f, "Check bits: 0b{:05b}", self.flags_check_bits & 0x1f)?;
-        writeln!(f, "Compressed data length: {}", self.compressed_data.len())?;
-        writeln!(
-            f,
-            "Checksum (ADLER-32): {:#x}",
-            u32::from_be_bytes(self.checksum)
-        )
+        writeln!(f, "Compressed data length: {}", self.compressed_data.len())
     }
 }
 
@@ -108,17 +120,15 @@ impl TryFrom<&[u8]> for Stream {
         } else {
             None
         };
-        let checksum = bytes[bytes.len() - 4..].try_into()?;
         // NOTE: here we are just assuming that the full bytes slice is the entirety of the stream.
         // This will probably change once decompression of the data is properly implemented
-        let compressed_data = bytes[compressed_data_offset..bytes.len() - 4].to_vec();
+        let compressed_data = bytes[compressed_data_offset..].to_vec();
         Ok(Self {
             compression_method,
             preset_dictionary,
             flags_check_bits,
             compression_level,
             compressed_data,
-            checksum,
         })
     }
 }
@@ -130,9 +140,22 @@ enum BlockType {
     Reserved,
 }
 
+// RFC 1951, Section 3.2.6.
+const FIXED_HUFFMAN_LITERALS_CODES_LENGTHS: [usize; 288] = [
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8,
+];
+
 impl From<u8> for BlockType {
     fn from(byte: u8) -> Self {
-        match byte & 0x03 {
+        match byte & BLOCK_TYPE_MASK {
             0b00 => Self::NoCompression,
             0b01 => Self::FixedHuffmanCodes,
             0b10 => Self::DynamicHuffmanCodes,
@@ -142,10 +165,9 @@ impl From<u8> for BlockType {
     }
 }
 
+// An iterator that pops through each bit in LSB order in a buffer of bytes
 struct LSBBitsIterator<'a> {
     buffer: &'a [u8],
-    current_byte: u8,
-    byte_cursor: usize,
     bits_read_so_far: usize,
 }
 
@@ -153,23 +175,21 @@ impl<'a> LSBBitsIterator<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self {
             buffer: bytes,
-            current_byte: bytes.first().copied().unwrap_or(0),
-            byte_cursor: 0,
             bits_read_so_far: 0,
         }
     }
 
+    #[inline]
+    fn exhausted(&self) -> bool {
+        self.bits_read_so_far / 8 >= self.buffer.len()
+    }
+
     fn pop_bit(&mut self) -> Option<u8> {
-        if self.byte_cursor >= self.buffer.len() {
+        if self.exhausted() {
             return None;
         }
-        let bit = self.current_byte & 1;
+        let bit = (self.buffer[self.bits_read_so_far / 8] >> (self.bits_read_so_far % 8)) & 1;
         self.bits_read_so_far += 1;
-        if self.bits_read_so_far % 8 == 0 {
-            self.go_to_next_byte();
-        } else {
-            self.current_byte >>= 1;
-        }
         Some(bit)
     }
 
@@ -187,7 +207,7 @@ impl<'a> LSBBitsIterator<'a> {
 
         while bits_written < n {
             let byte_pos = self.bits_read_so_far / 8;
-            let shiftr = 8 - self.bits_read_so_far % 8;
+            let shiftr = self.bits_read_so_far % 8;
 
             let bits_to_read_from_byte = (n - bits_written).min(8 - shiftr);
 
@@ -206,11 +226,6 @@ impl<'a> LSBBitsIterator<'a> {
             bits_written += bits_to_read_from_byte;
         }
 
-        self.byte_cursor = self.bits_read_so_far / 8;
-        if self.byte_cursor < self.buffer.len() {
-            self.current_byte = self.buffer[self.byte_cursor] >> (self.bits_read_so_far % 8)
-        }
-
         Some(result)
     }
 
@@ -224,15 +239,9 @@ impl<'a> LSBBitsIterator<'a> {
         self.bits_read_so_far
     }
 
-    fn byte_cursor(&self) -> usize {
-        self.byte_cursor
-    }
-
-    fn go_to_next_byte(&mut self) -> bool {
-        if self.byte_cursor < self.buffer.len() - 1 {
-            self.byte_cursor += 1;
-            self.bits_read_so_far = self.byte_cursor * 8;
-            self.current_byte = self.buffer[self.byte_cursor];
+    fn align_to_next_byte(&mut self) -> bool {
+        if self.bits_read_so_far < (self.buffer.len() - 1) * 8 {
+            self.bits_read_so_far += 8 - (self.bits_read_so_far % 8);
             true
         } else {
             false
@@ -240,35 +249,80 @@ impl<'a> LSBBitsIterator<'a> {
     }
 
     fn pop_byte_aligned_u16(&mut self) -> Option<u16> {
-        if self.bits_read_so_far % 8 != 0 || self.buffer.len() - self.byte_cursor < 2 {
+        if self.bits_read_so_far % 8 != 0 || self.buffer.len() * 8 - self.bits_read_so_far < 2 * 8 {
             return None;
         }
         let result = u16::from_le_bytes([
-            self.buffer[self.byte_cursor],
-            self.buffer[self.byte_cursor + 1],
+            self.buffer[self.bits_read_so_far / 8],
+            self.buffer[self.bits_read_so_far / 8 + 1],
         ]);
         self.bits_read_so_far += 2 * 8;
-        self.byte_cursor += 2;
-        if self.byte_cursor < self.buffer.len() {
-            self.current_byte = self.buffer[self.byte_cursor];
-        }
         Some(result)
     }
 
     fn pop_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.bits_read_so_far % 8 != 0 || self.buffer.len() - self.byte_cursor < n {
+        if self.bits_read_so_far % 8 != 0 || self.buffer.len() * 8 - self.bits_read_so_far < n * 8 {
             return None;
         }
-        let current_position = self.byte_cursor;
-        self.byte_cursor += n;
-        self.bits_read_so_far = 8 * self.byte_cursor;
+        let current_position = self.bits_read_so_far / 8;
+        self.bits_read_so_far += n * 8;
         Some(&self.buffer[current_position..][..n])
     }
 }
 
-pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+struct FixedHuffmanDecompressor {
+    fixed_huffman_code_to_literal: [u16; 1024],
+}
+
+impl FixedHuffmanDecompressor {
+    fn move_to_next_node(current_node: &mut u16, next_bit: u8) {
+        *current_node = 2 * *current_node + 1 + next_bit as u16;
+    }
+
+    fn new() -> Self {
+        // 0x3ff is a code that can not occur
+        const INVALID_CODE: u16 = 0x3ff;
+        let mut fixed_huffman_code_to_literal = [INVALID_CODE; 1024];
+        for (i, &code) in huffman_codes(&FIXED_HUFFMAN_LITERALS_CODES_LENGTHS)
+            .iter()
+            .enumerate()
+        {
+            let code_len = FIXED_HUFFMAN_LITERALS_CODES_LENGTHS[i];
+            let mut code_lsb = code.reverse_bits() >> (u16::BITS as usize - code_len);
+            let mut current_node = 0;
+            for _ in 0..code_len {
+                let next_bit = code_lsb as u8 & 1;
+                Self::move_to_next_node(&mut current_node, next_bit);
+                code_lsb >>= 1;
+            }
+            fixed_huffman_code_to_literal[current_node as usize] = i as u16;
+        }
+        Self {
+            fixed_huffman_code_to_literal,
+        }
+    }
+
+    #[inline]
+    fn is_invalid(&self, code: u16) -> bool {
+        if code as usize > self.fixed_huffman_code_to_literal.len() - 1 {
+            return true;
+        }
+        self.fixed_huffman_code_to_literal[code as usize] == 0x3ff
+    }
+
+    #[inline]
+    fn decode(&self, code: u16) -> u16 {
+        self.fixed_huffman_code_to_literal[code as usize]
+    }
+}
+
+// Returns uncompressed data and the number of compressed bytes parsed
+pub fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
     let mut lsb_iterator = LSBBitsIterator::new(bytes);
     let mut result = vec![];
+
+    let fixed_huffman_decompressor = FixedHuffmanDecompressor::new();
+
     loop {
         let Some(last) = lsb_iterator.pop_bit().map(|x| x == 1) else {
             bail!(
@@ -276,7 +330,7 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
                 lsb_iterator.bit_cursor()
             )
         };
-        let Some(block_type) = lsb_iterator.pop_reversed_bits(2).map(|x| x.into()) else {
+        let Some(block_type) = lsb_iterator.pop_bits(2).map(|x| x.into()) else {
             bail!(
                 "missing bfinal bit at position {}",
                 lsb_iterator.bit_cursor()
@@ -284,7 +338,7 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         };
         match block_type {
             BlockType::NoCompression => {
-                if !lsb_iterator.go_to_next_byte() {
+                if !lsb_iterator.align_to_next_byte() {
                     bail!("stream ended too early")
                 }
                 let Some(len) = lsb_iterator.pop_byte_aligned_u16() else {
@@ -305,7 +359,40 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
                     )
                 ))?);
             }
-            BlockType::FixedHuffmanCodes => todo!(),
+            BlockType::FixedHuffmanCodes => loop {
+                let mut code = 0;
+                while fixed_huffman_decompressor.is_invalid(code) {
+                    let next_bit = lsb_iterator
+                        .pop_bit()
+                        .ok_or(anyhow::anyhow!("not enough bytes"))?;
+                    FixedHuffmanDecompressor::move_to_next_node(&mut code, next_bit);
+                }
+                let compressed_block_literal = fixed_huffman_decompressor.decode(code);
+                match compressed_block_literal {
+                    0..=255 => result.push(compressed_block_literal as u8),
+                    256 => break, // end of block
+                    257..=285 => {
+                        // length + distance
+                        let extra_bits = lsb_iterator
+                            .pop_bits(n_extra_bits_for_len_code(compressed_block_literal)?)
+                            .ok_or(anyhow::anyhow!("not enough bits"))?;
+                        let len =
+                            len_code_to_first_len(compressed_block_literal)? + extra_bits as u16;
+                        let distance_code = lsb_iterator
+                            .pop_reversed_bits(5)
+                            .ok_or(anyhow::anyhow!("not enough bits"))?;
+                        let extra_bits = lsb_iterator
+                            .pop_bits(n_extra_bits_for_distance_code(distance_code as u16)?)
+                            .ok_or(anyhow::anyhow!("not enough bits"))?;
+                        let distance = distance_code_to_first_distance(distance_code as u16)?
+                            + extra_bits as u16;
+                        for _ in 0..len {
+                            result.push(result[result.len() - distance as usize]);
+                        }
+                    }
+                    _ => bail!("invalid sequence of bits encountered"),
+                }
+            },
             BlockType::DynamicHuffmanCodes => todo!(),
             BlockType::Reserved => todo!(),
         }
@@ -313,7 +400,7 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
             break;
         }
     }
-    Ok(result)
+    Ok((result, lsb_iterator.bits_read_so_far.div_ceil(8)))
 }
 
 fn adler32(bytes: &[u8]) -> [u8; 4] {
@@ -402,7 +489,7 @@ const CODED_LENGTHS_X_OFFSET: u16 = 257;
 const CODED_LENGTHS_Y_BASES: [u16; 8] = [0, 8, 16, 32, 64, 128, 255, 256];
 const CODED_LENGTHS_Y_OFFSET: u16 = 3;
 
-fn len_code_to_first_len(mut code: u16) -> anyhow::Result<u16> {
+fn len_code_to_first_len(code: u16) -> anyhow::Result<u16> {
     ensure!((257..=285).contains(&code));
     if code == 285 {
         return Ok(258);
@@ -426,7 +513,7 @@ fn len_code_to_first_len(mut code: u16) -> anyhow::Result<u16> {
 }
 
 #[inline]
-fn n_extra_bits_for_len_code(mut code: u16) -> anyhow::Result<usize> {
+fn n_extra_bits_for_len_code(code: u16) -> anyhow::Result<usize> {
     ensure!((257..=285).contains(&code));
     if code == 285 {
         Ok(0)
@@ -445,7 +532,7 @@ const CODED_DISTANCES_Y_BASES: [u16; 15] = [
 ];
 const CODED_DISTANCES_Y_OFFSET: u16 = 1;
 
-fn distance_code_to_first_distance(mut code: u16) -> anyhow::Result<u16> {
+fn distance_code_to_first_distance(code: u16) -> anyhow::Result<u16> {
     ensure!((0..=29).contains(&code));
 
     let extra_bits = n_extra_bits_for_distance_code(code)?;
@@ -466,20 +553,12 @@ fn distance_code_to_first_distance(mut code: u16) -> anyhow::Result<u16> {
 }
 
 #[inline]
-fn n_extra_bits_for_distance_code(mut code: u16) -> anyhow::Result<usize> {
-    ensure!((0..=29).contains(&code));
+fn n_extra_bits_for_distance_code(code: u16) -> anyhow::Result<usize> {
+    ensure!((0..=29).contains(&code), "invalid distance code: {code}");
     Ok(CODED_DISTANCES_X_BASES
         // Find the index of the group this code belongs to.
         .partition_point(|&x| x <= code - CODED_DISTANCES_X_OFFSET)
         .saturating_sub(1))
-}
-
-#[inline]
-// TODO: probably the same as the one that uses partition_point, to investigate
-fn distance_to_encoded_bitlen(distance: usize) -> usize {
-    max((max(distance - 1, 1)).ilog2() as usize - 1, 0)
-}
-
 }
 
 #[cfg(test)]
@@ -488,6 +567,15 @@ mod tests {
 
     const COMPRESSED_HELLO: [u8; 17] =
         *b"\x78\x01\x01\x05\x00\xfa\xff\x68\x65\x6c\x6c\x6f\x06\x2c\x02\x15\x0a";
+
+    const COMPRESSED_42_FIXED: [u8; 10] = *b"\x78\x01\x33\x31\x02\x00\x00\x9c\x00\x67";
+    const COMPRESSED_GIT_BLOB_FIXED: [u8; 28] = [
+        0x78, 0x1, 0x4b, 0xca, 0xc9, 0x4f, 0x52, 0x30, 0x34, 0x62, 0xd0, 0x52, 0x28, 0x49, 0xad,
+        0x28, 0xb1, 0x4d, 0x2c, 0x2d, 0xc9, 0xe7, 0x2, 0x0, 0x3f, 0x6f, 0x6, 0x32,
+    ];
+
+    const COMPRESSED_GIT_TREE_FIXED: [u8; 328] =
+        *b"x\x01+)JMU065`01000P\xd0K\xceOIM.JL+I-*f\xe8\x8b\x9aT\x1a\x19#|\x87e\xd1\xdf\'\xa9\xfbg4u\x8b\x96\xfa\x19\x1a\x18\x98\x99\x98(\xe8\xa5g\x96$\x96\x94\x14e&\x95\x96\xa4\x163\x88g\xb9\xf6Oy\xf0*\xa8\xe8\\\xfa\xe1\xec\xcf\xdc\xd9/O}SFR\x99\x99\x9e\x97_\x94\xcaP\xfckC\xd1\xd1\xb5\x7f6\xac(THI\xecS\xe4Y~\xf4\xaa\x03T\x95sbQz\xbe^N~r6\xc3\x81\'\xd2.\x96\x7f\xbf\xe5>\xdf{D \xbe\xcb\x83\x93\xd1:\xbd\x1fEUI~n\x0eC\xfdV\x93\xef\x8b\xb4\xda\xb7\xb2\xae(4\xd8\xaee\xb4h\xe3\xd5u\x0cPUA\xae\x8e.\xbe\xaez\xb9)\x0c\x96\xfc,k\xb7\xc6\xc6\xde\x9afx\x7f\xe25g\x87\x88\x8c\x842_\xa8\"d\x8f\xeaU\xe6\xe604/\xee\xec\x95\x9c\xed[\xb6\xa1z\xf1\xb6#\xcd\xb5\xaf\x92\xddo\x1f\x80\x04JqQ2C\xffS\x81\x1f|\x11y\t\x95Q\xcbEO\x99\x9a^5\x13\tW740075U\xa8\xcc/-\x8a/(\xcaO/J\xcc\xd5+\xce`\xb8\xae\x92\xc1\xa2e\xef\xbeb\xf9|\x97#\x12Z}6>\x0bV\xe4\x00\x00Yg\x8b\x98";
 
     #[test]
     fn test_adler32_empty() {
@@ -616,9 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn test_inflate_no_compression_lsb() {
-        let uncompressed_hello = inflate(&COMPRESSED_HELLO[2..]).unwrap();
+    fn test_inflate_no_compression() {
+        let (uncompressed_hello, _) = inflate(&COMPRESSED_HELLO[2..]).unwrap();
         assert_eq!(b"hello", uncompressed_hello.as_slice());
     }
 
+    #[test]
+    fn test_inflate_fixed_huffman() {
+        let (uncompressed_42, _) = inflate(&COMPRESSED_42_FIXED[2..]).unwrap();
+        assert_eq!(b"42", uncompressed_42.as_slice());
+        let (uncompressed_blob, _) = inflate(&COMPRESSED_GIT_BLOB_FIXED[2..]).unwrap();
+        assert_eq!(b"blob 12\x00* text=auto\n", uncompressed_blob.as_slice());
+    }
+
+    #[test]
+    fn test_stream_inflate() {
+        let stream: Stream = COMPRESSED_GIT_TREE_FIXED.as_slice().try_into().unwrap();
+        // Output is too big to compare directly, just interested in whether inflating and
+        // verifying the checksum works without panicking
+        stream.inflate().unwrap();
+    }
 }

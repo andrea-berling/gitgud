@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::io::stdout;
+use std::io::Write;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -9,7 +11,6 @@ mod zlib;
 
 fn main() -> anyhow::Result<()> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    eprintln!("Logs from your program will appear here!");
 
     // Uncomment this block to pass the first stage
     let args: Vec<String> = env::args().collect();
@@ -27,6 +28,14 @@ fn main() -> anyhow::Result<()> {
             let stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             print!("{stream}");
+            Ok(())
+        }
+        "zlib_inflate" => {
+            let bytes = fs::read(&args[2]).context(format!("reading from {}", &args[2]))?;
+            let stream: zlib::Stream =
+                bytes.as_slice().try_into().context("decoding read bytes")?;
+            stdout().write_all(&stream.inflate()?)?;
+            stdout().flush()?;
             Ok(())
         }
         _ => {
