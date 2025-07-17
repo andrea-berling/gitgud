@@ -123,6 +123,199 @@ impl TryFrom<&[u8]> for Stream {
     }
 }
 
+enum BlockType {
+    NoCompression,
+    FixedHuffmanCodes,
+    DynamicHuffmanCodes,
+    Reserved,
+}
+
+impl From<u8> for BlockType {
+    fn from(byte: u8) -> Self {
+        match byte & 0x03 {
+            0b00 => Self::NoCompression,
+            0b01 => Self::FixedHuffmanCodes,
+            0b10 => Self::DynamicHuffmanCodes,
+            0b11 => Self::Reserved,
+            _ => unreachable!(),
+        }
+    }
+}
+
+struct LSBBitsIterator<'a> {
+    buffer: &'a [u8],
+    current_byte: u8,
+    byte_cursor: usize,
+    bits_read_so_far: usize,
+}
+
+impl<'a> LSBBitsIterator<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            buffer: bytes,
+            current_byte: bytes.first().copied().unwrap_or(0),
+            byte_cursor: 0,
+            bits_read_so_far: 0,
+        }
+    }
+
+    fn pop_bit(&mut self) -> Option<u8> {
+        if self.byte_cursor >= self.buffer.len() {
+            return None;
+        }
+        let bit = self.current_byte & 1;
+        self.bits_read_so_far += 1;
+        if self.bits_read_so_far % 8 == 0 {
+            self.go_to_next_byte();
+        } else {
+            self.current_byte >>= 1;
+        }
+        Some(bit)
+    }
+
+    // Reads `n` bits from the stream LSB-first (no more than 8).
+    fn pop_bits(&mut self, n: usize) -> Option<u8> {
+        if n > 8 {
+            return None;
+        }
+        if self.buffer.len() * 8 < self.bits_read_so_far + n {
+            return None;
+        }
+
+        let mut result = 0u8;
+        let mut bits_written = 0;
+
+        while bits_written < n {
+            let byte_pos = self.bits_read_so_far / 8;
+            let shiftr = 8 - self.bits_read_so_far % 8;
+
+            let bits_to_read_from_byte = (n - bits_written).min(8 - shiftr);
+
+            // Take a chunk from the current byte
+            let chunk = self.buffer[byte_pos] >> shiftr;
+
+            // Mask out just the bits we want
+            let mask = (1u8 << bits_to_read_from_byte) - 1;
+            let masked_chunk = chunk & mask;
+
+            // Place the chunk into the result at the correct position
+            result |= masked_chunk << bits_written;
+
+            // Advance cursors
+            self.bits_read_so_far += bits_to_read_from_byte;
+            bits_written += bits_to_read_from_byte;
+        }
+
+        self.byte_cursor = self.bits_read_so_far / 8;
+        if self.byte_cursor < self.buffer.len() {
+            self.current_byte = self.buffer[self.byte_cursor] >> (self.bits_read_so_far % 8)
+        }
+
+        Some(result)
+    }
+
+    fn pop_reversed_bits(&mut self, n: usize) -> Option<u8> {
+        let val = self.pop_bits(n)?;
+        // For u8, it would be .reverse_bits() >> (8 - n)
+        Some(val.reverse_bits() >> (8 - n))
+    }
+
+    fn bit_cursor(&self) -> usize {
+        self.bits_read_so_far
+    }
+
+    fn byte_cursor(&self) -> usize {
+        self.byte_cursor
+    }
+
+    fn go_to_next_byte(&mut self) -> bool {
+        if self.byte_cursor < self.buffer.len() - 1 {
+            self.byte_cursor += 1;
+            self.bits_read_so_far = self.byte_cursor * 8;
+            self.current_byte = self.buffer[self.byte_cursor];
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pop_byte_aligned_u16(&mut self) -> Option<u16> {
+        if self.bits_read_so_far % 8 != 0 || self.buffer.len() - self.byte_cursor < 2 {
+            return None;
+        }
+        let result = u16::from_le_bytes([
+            self.buffer[self.byte_cursor],
+            self.buffer[self.byte_cursor + 1],
+        ]);
+        self.bits_read_so_far += 2 * 8;
+        self.byte_cursor += 2;
+        if self.byte_cursor < self.buffer.len() {
+            self.current_byte = self.buffer[self.byte_cursor];
+        }
+        Some(result)
+    }
+
+    fn pop_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.bits_read_so_far % 8 != 0 || self.buffer.len() - self.byte_cursor < n {
+            return None;
+        }
+        let current_position = self.byte_cursor;
+        self.byte_cursor += n;
+        self.bits_read_so_far = 8 * self.byte_cursor;
+        Some(&self.buffer[current_position..][..n])
+    }
+}
+
+pub fn inflate(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut lsb_iterator = LSBBitsIterator::new(bytes);
+    let mut result = vec![];
+    loop {
+        let Some(last) = lsb_iterator.pop_bit().map(|x| x == 1) else {
+            bail!(
+                "missing bfinal bit at position {}",
+                lsb_iterator.bit_cursor()
+            )
+        };
+        let Some(block_type) = lsb_iterator.pop_reversed_bits(2).map(|x| x.into()) else {
+            bail!(
+                "missing bfinal bit at position {}",
+                lsb_iterator.bit_cursor()
+            )
+        };
+        match block_type {
+            BlockType::NoCompression => {
+                if !lsb_iterator.go_to_next_byte() {
+                    bail!("stream ended too early")
+                }
+                let Some(len) = lsb_iterator.pop_byte_aligned_u16() else {
+                    bail!("stream ended too early: couldn't read LEN")
+                };
+                let Some(nlen) = lsb_iterator.pop_byte_aligned_u16() else {
+                    bail!("stream ended too early: couldn't read NLEN")
+                };
+                ensure!(
+                    !len == nlen,
+                    "inconsistent values for LEN and NLEN before bit {}",
+                    lsb_iterator.bit_cursor()
+                );
+                result.extend(lsb_iterator.pop_bytes(len as usize).ok_or(anyhow::anyhow!(
+                    format!(
+                        "not enough bytes or wrong alignment at {}",
+                        lsb_iterator.bit_cursor()
+                    )
+                ))?);
+            }
+            BlockType::FixedHuffmanCodes => todo!(),
+            BlockType::DynamicHuffmanCodes => todo!(),
+            BlockType::Reserved => todo!(),
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(result)
+}
+
 fn adler32(bytes: &[u8]) -> [u8; 4] {
     const MOD_ADLER: u32 = 65521;
     let (mut s1, mut s2) = (1u32, 0u32);
@@ -287,31 +480,14 @@ fn distance_to_encoded_bitlen(distance: usize) -> usize {
     max((max(distance - 1, 1)).ilog2() as usize - 1, 0)
 }
 
-fn read_bits(bytes: &[u8], mut loffset_bits: usize, mut how_many: usize) -> anyhow::Result<u16> {
-    ensure!(how_many <= 16);
-    if how_many == 0 {
-        return Ok(0);
-    }
-    ensure!(bytes.len() >= (loffset_bits + how_many).div_ceil(8));
-    let mut result = 0u16;
-
-    while how_many > 0 {
-        let offset_within_the_byte = loffset_bits % 8;
-        let current_byte = loffset_bits / 8;
-        let bits_to_extract = (8 - offset_within_the_byte).min(how_many);
-        let shiftr = 8 - offset_within_the_byte - bits_to_extract;
-        let mask = ((1 << bits_to_extract) - 1) as u8;
-        result = (result << bits_to_extract) | (((bytes[current_byte] >> shiftr) & mask) as u16);
-        how_many -= bits_to_extract;
-        loffset_bits += bits_to_extract;
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMPRESSED_HELLO: [u8; 17] =
+        *b"\x78\x01\x01\x05\x00\xfa\xff\x68\x65\x6c\x6c\x6f\x06\x2c\x02\x15\x0a";
 
     #[test]
     fn test_adler32_empty() {
@@ -438,4 +614,11 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_inflate_no_compression_lsb() {
+        let uncompressed_hello = inflate(&COMPRESSED_HELLO[2..]).unwrap();
+        assert_eq!(b"hello", uncompressed_hello.as_slice());
+    }
+
 }
