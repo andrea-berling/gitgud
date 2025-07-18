@@ -120,8 +120,6 @@ impl TryFrom<&[u8]> for Stream {
         } else {
             None
         };
-        // NOTE: here we are just assuming that the full bytes slice is the entirety of the stream.
-        // This will probably change once decompression of the data is properly implemented
         let compressed_data = bytes[compressed_data_offset..].to_vec();
         Ok(Self {
             compression_method,
@@ -268,51 +266,107 @@ impl<'a> LSBBitsIterator<'a> {
         self.bits_read_so_far += n * 8;
         Some(&self.buffer[current_position..][..n])
     }
+
+    fn huffman_decode(&mut self, decompressor: &HuffmanDecompressor) -> anyhow::Result<u16> {
+        let mut current_node_idx = 0;
+        while !decompressor.is_leaf(current_node_idx) {
+            let next_bit = self.pop_bit().ok_or(anyhow::anyhow!("not enough bytes"))?;
+            current_node_idx = decompressor
+                .next_node_idx(current_node_idx, next_bit)
+                .ok_or(anyhow::anyhow!("undexpected bit encountered"))?;
+        }
+        decompressor
+            .decode(current_node_idx)
+            .ok_or(anyhow::anyhow!("invalid code found"))
+    }
 }
 
-struct FixedHuffmanDecompressor {
-    fixed_huffman_code_to_literal: [u16; 1024],
+#[derive(Debug, Default, Clone, Copy)]
+struct HuffmanNode {
+    left: Option<u16>,
+    right: Option<u16>,
+    payload: Option<u16>, // None means it's an internal node without a value
 }
 
-impl FixedHuffmanDecompressor {
-    fn move_to_next_node(current_node: &mut u16, next_bit: u8) {
-        *current_node = 2 * *current_node + 1 + next_bit as u16;
+impl HuffmanNode {
+    fn is_leaf(&self) -> bool {
+        self.payload.is_some()
+    }
+}
+
+struct HuffmanDecompressor {
+    // A Huffman tree for N symbols has at most 2N-1 nodes.
+    // The largest alphabet is the fixed literal/length alphabet with 288 symbols.
+    decoder: Vec<HuffmanNode>,
+}
+
+impl HuffmanDecompressor {
+    fn next_node_idx(&self, current_node_idx: usize, next_bit: u8) -> Option<usize> {
+        if current_node_idx > self.decoder.len() - 1 {
+            return None;
+        }
+        if next_bit == 1 {
+            self.decoder[current_node_idx].right.map(|x| x as usize)
+        } else {
+            self.decoder[current_node_idx].left.map(|x| x as usize)
+        }
     }
 
-    fn new() -> Self {
-        // 0x3ff is a code that can not occur
-        const INVALID_CODE: u16 = 0x3ff;
-        let mut fixed_huffman_code_to_literal = [INVALID_CODE; 1024];
-        for (i, &code) in huffman_codes(&FIXED_HUFFMAN_LITERALS_CODES_LENGTHS)
-            .iter()
-            .enumerate()
-        {
-            let code_len = FIXED_HUFFMAN_LITERALS_CODES_LENGTHS[i];
+    fn new(code_lengths: &[usize]) -> Self {
+        let num_symbols = code_lengths.len();
+        let max_nodes = 2 * num_symbols - 1;
+        let mut decoder = Vec::with_capacity(max_nodes);
+        decoder.push(HuffmanNode::default());
+        for (i, &code) in huffman_codes(code_lengths).iter().enumerate() {
+            let code_len = code_lengths[i];
             let mut code_lsb = code.reverse_bits() >> (u16::BITS as usize - code_len);
-            let mut current_node = 0;
+            let mut current_node_idx = 0;
             for _ in 0..code_len {
                 let next_bit = code_lsb as u8 & 1;
-                Self::move_to_next_node(&mut current_node, next_bit);
+                match next_bit {
+                    0 => {
+                        if let Some(idx) = decoder[current_node_idx].left {
+                            current_node_idx = idx as usize;
+                        } else {
+                            decoder.push(HuffmanNode::default());
+                            let new_index = decoder.len() as u16 - 1;
+                            current_node_idx =
+                                *decoder[current_node_idx].left.get_or_insert(new_index) as usize;
+                        }
+                    }
+                    1 => {
+                        if let Some(idx) = decoder[current_node_idx].right {
+                            current_node_idx = idx as usize;
+                        } else {
+                            decoder.push(HuffmanNode::default());
+                            let new_index = decoder.len() as u16 - 1;
+                            current_node_idx =
+                                *decoder[current_node_idx].right.get_or_insert(new_index) as usize;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
                 code_lsb >>= 1;
             }
-            fixed_huffman_code_to_literal[current_node as usize] = i as u16;
+            let _ = decoder[current_node_idx].payload.insert(i as u16);
         }
-        Self {
-            fixed_huffman_code_to_literal,
-        }
+        Self { decoder }
     }
 
     #[inline]
-    fn is_invalid(&self, code: u16) -> bool {
-        if code as usize > self.fixed_huffman_code_to_literal.len() - 1 {
+    fn is_leaf(&self, idx: usize) -> bool {
+        if idx > self.decoder.len() - 1 {
             return true;
         }
-        self.fixed_huffman_code_to_literal[code as usize] == 0x3ff
+        self.decoder[idx].is_leaf()
     }
 
     #[inline]
-    fn decode(&self, code: u16) -> u16 {
-        self.fixed_huffman_code_to_literal[code as usize]
+    fn decode(&self, idx: usize) -> Option<u16> {
+        if idx > self.decoder.len() - 1 {
+            return None;
+        }
+        self.decoder[idx].payload
     }
 }
 
@@ -321,7 +375,8 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
     let mut lsb_iterator = LSBBitsIterator::new(bytes);
     let mut result = vec![];
 
-    let fixed_huffman_decompressor = FixedHuffmanDecompressor::new();
+    let fixed_huffman_decompressor =
+        HuffmanDecompressor::new(&FIXED_HUFFMAN_LITERALS_CODES_LENGTHS);
 
     loop {
         let Some(last) = lsb_iterator.pop_bit().map(|x| x == 1) else {
@@ -360,14 +415,9 @@ pub fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 ))?);
             }
             BlockType::FixedHuffmanCodes => loop {
-                let mut code = 0;
-                while fixed_huffman_decompressor.is_invalid(code) {
-                    let next_bit = lsb_iterator
-                        .pop_bit()
-                        .ok_or(anyhow::anyhow!("not enough bytes"))?;
-                    FixedHuffmanDecompressor::move_to_next_node(&mut code, next_bit);
-                }
-                let compressed_block_literal = fixed_huffman_decompressor.decode(code);
+                let compressed_block_literal = lsb_iterator
+                    .huffman_decode(&fixed_huffman_decompressor)
+                    .context("decoding bits with the fixed huffman decoder")?;
                 match compressed_block_literal {
                     0..=255 => result.push(compressed_block_literal as u8),
                     256 => break, // end of block
