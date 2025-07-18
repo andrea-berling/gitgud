@@ -82,6 +82,29 @@ fn main() -> anyhow::Result<()> {
             println!("{object_sha}");
             Ok(())
         }
+        "ls-tree" => {
+            ensure!(args[2] == "--name-only");
+            let tree_sha = &args[3];
+            let file_bytes = fs::read(PathBuf::from_iter([
+                ".git",
+                "objects",
+                &tree_sha[..2],
+                &tree_sha[2..],
+            ]))
+            .context(format!("reading from object file for {tree_sha}"))?;
+            let mut stream = zlib::Stream::try_from(file_bytes.as_slice())
+                .context(format!("decompressing object file for {tree_sha}",))?;
+            let tree_bytes = stream
+                .inflate()
+                .context(format!("decompressing object file for {tree_sha}",))?;
+            let tree: git::Tree = tree_bytes
+                .try_into()
+                .context("interpreting object bytes as a tree")?;
+            for entry in tree.entries() {
+                println!("{}", entry.name());
+            }
+            Ok(())
+        }
         "zlib_metadata" => {
             let bytes = fs::read(&args[2]).context(format!("reading from {}", &args[2]))?;
             let stream: zlib::Stream =
