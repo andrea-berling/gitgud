@@ -1,4 +1,4 @@
-use std::{fmt::Display, iter::zip};
+use std::{fmt::Display, io::Write, iter::zip};
 
 use anyhow::{bail, ensure, Context};
 
@@ -6,7 +6,7 @@ const COMPRESSION_LEVEL_MASK: u8 = 0x3;
 const BLOCK_TYPE_MASK: u8 = 0x3;
 const DEFLATE_IDENTIFIER: u8 = 0x8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum CompressionLevel {
     Lowest,
     Low,
@@ -60,23 +60,51 @@ pub struct Stream {
     preset_dictionary: Option<[u8; 4]>,
     flags_check_bits: u8,
     compression_level: CompressionLevel,
-    compressed_data: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl Stream {
-    pub fn inflate(&self) -> anyhow::Result<Vec<u8>> {
+    pub fn new(
+        compression_method: CompressionMethod,
+        preset_dictionary: Option<[u8; 4]>,
+        compression_level: CompressionLevel,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            compression_method,
+            preset_dictionary,
+            flags_check_bits: 0,
+            compression_level,
+            bytes,
+        }
+    }
+
+    pub fn deflate(&mut self) -> anyhow::Result<&[u8]> {
+        let checksum = adler32(&self.bytes);
+        self.flags_check_bits = 1;
+        let mut compressed_data = deflate(&self.bytes, self.compression_level)
+            .context("deflating the compressed data")?;
+        self.bytes.clear();
+        self.bytes.write_all(b"\x78\x01")?;
+        self.bytes.append(&mut compressed_data);
+        self.bytes.write_all(&checksum)?;
+        Ok(&self.bytes)
+    }
+
+    pub fn inflate(&mut self) -> anyhow::Result<&[u8]> {
         let (result, parsed_bytes) =
-            inflate(&self.compressed_data).context("inflating the compressed data")?;
+            inflate(&self.bytes).context("inflating the compressed data")?;
         ensure!(
-            self.compressed_data.len() - parsed_bytes >= 4,
+            self.bytes.len() - parsed_bytes >= 4,
             "missing ADLER-32 checksum"
         );
-        let checksum: [u8; 4] = self.compressed_data[parsed_bytes..][..4].try_into()?;
+        let checksum: [u8; 4] = self.bytes[parsed_bytes..][..4].try_into()?;
         ensure!(
             adler32(&result) == checksum,
             "invalid checksum after the compressed data"
         );
-        Ok(result)
+        self.bytes = result;
+        Ok(&self.bytes)
     }
 }
 
@@ -92,7 +120,7 @@ impl Display for Stream {
         )?;
         writeln!(f, "Compression level: {:?}", self.compression_level)?;
         writeln!(f, "Check bits: 0b{:05b}", self.flags_check_bits & 0x1f)?;
-        writeln!(f, "Compressed data length: {}", self.compressed_data.len())
+        writeln!(f, "Compressed data length: {}", self.bytes.len())
     }
 }
 
@@ -126,7 +154,7 @@ impl TryFrom<&[u8]> for Stream {
             preset_dictionary,
             flags_check_bits,
             compression_level,
-            compressed_data,
+            bytes: compressed_data,
         })
     }
 }
@@ -500,8 +528,28 @@ fn get_decoders_from_encoded_lengths(
     ))
 }
 
-// Returns uncompressed data and the number of compressed bytes parsed
-pub fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
+fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
+    let mut result = vec![];
+    // TODO: a system to cleverly divide the input into blocks, select the appropriate compression
+    // method for each block, and use that
+    match level {
+        CompressionLevel::Lowest => {
+            ensure!(bytes.len() < u16::MAX as usize);
+            result.write_all(b"\x01")?;
+            let len = bytes.len() as u16;
+            result.write_all(&len.to_le_bytes())?;
+            result.write_all(&(!len).to_le_bytes())?;
+            result.write_all(bytes)?;
+        }
+        CompressionLevel::Low => todo!(),
+        CompressionLevel::Medium => todo!(),
+        CompressionLevel::Highest => todo!(),
+    }
+
+    Ok(result)
+}
+
+fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
     let mut lsb_iterator = LSBBitsIterator::new(bytes);
     let mut result = vec![];
 
