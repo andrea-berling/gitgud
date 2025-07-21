@@ -586,8 +586,8 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 };
                 ensure!(
                     !len == nlen,
-                    "inconsistent values for LEN and NLEN before bit {}",
-                    lsb_iterator.bit_cursor()
+                    "inconsistent values for LEN and NLEN before at {}",
+                    lsb_iterator.bit_cursor() - 32
                 );
                 result.extend(lsb_iterator.pop_bytes(len as usize).ok_or(anyhow::anyhow!(
                     format!(
