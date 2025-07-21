@@ -7,6 +7,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Ok;
 use clap::{Parser, Subcommand};
+use git::FromSha1Hex;
 
 mod git;
 mod sha1;
@@ -29,7 +30,7 @@ enum Command {
         #[arg(short = 'p')]
         pretty_print: bool,
         /// The object to display
-        object: String,
+        object_sha: String,
     },
     /// Compute object ID and optionally creates a blob from a file
     HashObject {
@@ -47,6 +48,8 @@ enum Command {
         /// The tree object to list
         tree_sha: String,
     },
+    /// Write the current working directory to a new tree object
+    WriteTree,
     /// Print zlib metadata from a file
     ZlibMetadata {
         /// The file to read
@@ -65,6 +68,8 @@ fn main() -> anyhow::Result<()> {
     // Uncomment this block to pass the first stage
     let cli = Cli::parse();
 
+    let git_dir = PathBuf::from(".git");
+
     match &cli.command {
         Command::Init => {
             fs::create_dir(".git").unwrap();
@@ -76,27 +81,13 @@ fn main() -> anyhow::Result<()> {
         }
         Command::CatFile {
             pretty_print,
-            object,
+            object_sha: object,
         } => {
             if !pretty_print {
                 bail!("cat-file currently only supports the -p option");
             }
-            let object_sha = object;
-            let file_bytes = fs::read(PathBuf::from_iter([
-                ".git",
-                "objects",
-                &object_sha[..2],
-                &object_sha[2..],
-            ]))
-            .context(format!("reading from object file for {object_sha}"))?;
-            let mut stream = zlib::Stream::try_from(file_bytes.as_slice())
-                .context(format!("decompressing object file for {object_sha}",))?;
-            let object_bytes = stream
-                .inflate()
-                .context(format!("decompressing object file for {object_sha}",))?;
-            let blob: git::Blob = object_bytes
-                .try_into()
-                .context("interpreting object bytes as a blob")?;
+            let blob = git::Blob::from_sha1_hex(object, &git_dir)
+                .context(format!("making a blob from {object}"))?;
             stdout().write_all(blob.bytes())?;
             stdout().flush()?;
             Ok(())
@@ -105,35 +96,11 @@ fn main() -> anyhow::Result<()> {
             if !write {
                 bail!("hash-object currently only supports the -w option");
             }
-            let object_filename = file;
-            let blob_payload =
-                fs::read(object_filename).context(format!("reading from {object_filename}"))?;
-            let object_bytes = [
-                b"blob ",
-                blob_payload.len().to_string().as_bytes(),
-                b"\x00",
-                &blob_payload,
-            ]
-            .concat();
-            let object_sha = sha1::hex_encode(&sha1::sha1(&object_bytes));
-
-            let mut stream = zlib::Stream::new(
-                zlib::CompressionMethod::DEFLATE(2 << 7),
-                None,
-                zlib::CompressionLevel::Lowest,
-                object_bytes,
-            );
-            let object_bytes = stream
-                .deflate()
-                .context(format!("decompressing object file for {object_filename}",))?;
-
-            let dir_path = PathBuf::from_iter([".git", "objects", &object_sha[..2]]);
-            if !fs::exists(&dir_path)? {
-                fs::create_dir(&dir_path)?;
-            }
-            fs::write(dir_path.join(&object_sha[2..]), object_bytes)
-                .context(format!("writing into object file for {object_sha}"))?;
-            println!("{object_sha}");
+            let blob = git::Blob::from_path(&PathBuf::from(&file))
+                .context(format!("making a blob from {file}"))?;
+            blob.serialize(&git_dir)
+                .context(format!("serializing {file} into the git database"))?;
+            println!("{}", sha1::hex_encode(&blob.digest()));
             Ok(())
         }
         Command::LsTree {
@@ -143,39 +110,36 @@ fn main() -> anyhow::Result<()> {
             if !name_only {
                 bail!("ls-tree currently only supports the --name-only option");
             }
-            let file_bytes = fs::read(PathBuf::from_iter([
-                ".git",
-                "objects",
-                &tree_sha[..2],
-                &tree_sha[2..],
-            ]))
-            .context(format!("reading from object file for {tree_sha}"))?;
-            let mut stream = zlib::Stream::try_from(file_bytes.as_slice())
-                .context(format!("decompressing object file for {tree_sha}",))?;
-            let tree_bytes = stream
-                .inflate()
-                .context(format!("decompressing object file for {tree_sha}",))?;
-            let tree: git::Tree = tree_bytes
-                .try_into()
-                .context("interpreting object bytes as a tree")?;
+
+            let tree = git::Tree::from_sha1_hex(tree_sha, &git_dir)
+                .context(format!("fetching tree for {tree_sha}"))?;
             for entry in tree.entries() {
                 println!("{}", entry.name());
             }
             Ok(())
         }
         Command::ZlibMetadata { file } => {
-            let bytes = fs::read(file).context(format!("reading from {}", file))?;
+            let bytes = fs::read(file).context(format!("reading from {file}",))?;
             let stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             print!("{stream}");
             Ok(())
         }
         Command::ZlibInflate { file } => {
-            let bytes = fs::read(file).context(format!("reading from {}", file))?;
+            let bytes = fs::read(file).context(format!("reading from {file}",))?;
             let mut stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             stdout().write_all(stream.inflate()?)?;
             stdout().flush()?;
+            Ok(())
+        }
+        Command::WriteTree => {
+            let cwd = &PathBuf::from(".");
+            let tree = git::Tree::from_path(cwd)
+                .context("making a tree object from the current directory")?;
+            tree.serialize(cwd, &git_dir)
+                .context("serializing tree for current directory")?;
+            println!("{}", sha1::hex_encode(&tree.digest()));
             Ok(())
         }
     }
