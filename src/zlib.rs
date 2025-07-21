@@ -159,6 +159,7 @@ impl TryFrom<&[u8]> for Stream {
     }
 }
 
+#[derive(Clone, Copy)]
 enum BlockType {
     NoCompression,
     FixedHuffmanCodes,
@@ -268,8 +269,10 @@ impl<'a> LSBBitsIterator<'a> {
         self.bits_read_so_far
     }
 
-    fn align_to_next_byte(&mut self) -> bool {
-        if self.bits_read_so_far < (self.buffer.len() - 1) * 8 {
+    fn align_to_next_byte_if_unaligned(&mut self) -> bool {
+        if self.bits_read_so_far % 8 == 0 {
+            true
+        } else if self.bits_read_so_far < (self.buffer.len() - 1) * 8 {
             self.bits_read_so_far += 8 - (self.bits_read_so_far % 8);
             true
         } else {
@@ -561,21 +564,15 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
     );
 
     loop {
-        let Some(last) = lsb_iterator.pop_bit().map(|x| x == 1) else {
-            bail!(
-                "missing bfinal bit at position {}",
-                lsb_iterator.bit_cursor()
-            )
-        };
-        let Some(block_type) = lsb_iterator.pop_bits(2).map(|x| (x as u8).into()) else {
-            bail!(
-                "missing btype bits at position {}",
-                lsb_iterator.bit_cursor()
-            )
-        };
+        let block_header = lsb_iterator.pop_bits(3).ok_or(anyhow::anyhow!(format!(
+            "not enough bits at {}: failed to read block header (3 bits)",
+            lsb_iterator.bit_cursor()
+        )))?;
+        let last = (block_header & 1) == 1;
+        let block_type = (block_header as u8 >> 1).into();
         match block_type {
             BlockType::NoCompression => {
-                if !lsb_iterator.align_to_next_byte() {
+                if !lsb_iterator.align_to_next_byte_if_unaligned() {
                     bail!("stream ended too early")
                 }
                 let Some(len) = lsb_iterator.pop_byte_aligned_u16() else {
@@ -586,8 +583,9 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 };
                 ensure!(
                     !len == nlen,
-                    "inconsistent values for LEN and NLEN before at {}",
-                    lsb_iterator.bit_cursor() - 32
+                    "inconsistent values for LEN and NLEN before at {}: {:#x?}",
+                    lsb_iterator.bit_cursor() - 32,
+                    bytes
                 );
                 result.extend(lsb_iterator.pop_bytes(len as usize).ok_or(anyhow::anyhow!(
                     format!(
@@ -891,6 +889,8 @@ mod tests {
 
     const COMPRESSED_GIT_COMMIT_DYNAMIC: &[u8] = b"x\x01\xad\x94MO\xdc0\x10\x86{\xce\xaf\x98S\x05\x94\r\xd9e?QU\x15\xe8\x07H\xadz\x00\xce\xb5=\x9e$.\x89\xbd\xb2\'\xc0\xf6\xd7Wv\xb2\xcb\x828\xf6\x14y\x9c\xbc3\xf3\xbc3A\xd7\xb6\x86a<-&\xef\xd8\x13\xc1\\/Vr\xa9\n\x9c\x16j\xb9\x9a\xc9\xc9\xa2\x9c\x95\n\xb5\x9a\xce\x968Y\x15j*O\xd5XR\xb6\x96\x9e,\xc3b\xa2\xd5\xaa\x9c\x11\xcdQ\xa9\xf9\xb2\x18#\xaa\xf1).K\xc4\xf9j>\xd7KU.f\xb8\\d\xb2\xe3\xday8\xb7\xda\x93\x84\x0b\xf2\x8d\xb1\x95!o\xe0\xa3L\xb1\x91\xeac\x9f\xbb@>\xe4\xd6yZ7\x9b\xbc2\\w*G\xd7~\x82\xf1bv:.V\xab\xe9\x0c>\x14\x93\xa2\xc80\x95\xcf\xf4\xbfu\xb3\x92$\x9f\xc1u\xbbn\xa8\x8dm~7\x0cN\xfd!d\xa8\xa5\xd5\xb1v\x90V\x83x\xf4\x86i\x14\xd1\t\x88\xd5H\xab\xb3\xec\xda\xb2w\xbaC\n1\xb6\xf6T\x93\r\xe6\x81\xde\x94)\x9d\x07\xd58\x15\x92`T\n\xc7\x99\xb1\xd8t:f\t\xe4\x8dl\xcc_\xc9\xc6\xd9c\xd0\xf4*\x10\xab\xb8\xb9:\x1f\x8d\xa1\x96\xa16\xb6\xca\xe1\xb66!\xf3TJd\xe7\xa3\x06\x92e\x1fE(l\xbbh\\e\x10\x1e\r\xd7\xc6\x82\x08\x1eO*\xc3\xb9\x0f\"\t\x1a\xcbTy\xc9\x142\xc3\xf1\xe4\x80k\x82V\x1a\x0b\x97?\xae\xb7\x9d\x86<\xcbFpt\xb4\xff\xfd\xd1\xd1Y\x06\x000\x82s\xadI\x83\xb8h\x9c\x12\xc7 n#\xa3\xe1\xf9\xd5\xb2\xdf\xbc8\xfct:\xde&\xa6\xbf\x12h\x91d\x00\x02\xfb\x0e9\x9c\x90\xed\xda\x90hyZ{\nd9\xf6\xf6\xecL\xc8\x87\xc4;\xdbb\xfa/;`\xd4\xf7&\xbey\xd7\xde\xd4r|EO\x02\xd8K\xc3\xbdl\xef\xef\x90\xf5\x15g(\xbdk\xf78\xd3.Y\xdfeK\\;\xbd\xaf\xf3\xd288\x10[\xdfH\x1c\x1e\x0fJ\xdaT\x14\xb6\x19Q6\xd85\xc9f8\x10\xfdU|5\"AO\xfdE*\xa34\r\xc1Zr\x1d\x86b\x0fD\x8c\xff\x8e!q\xb8\xa5p\xc7&:\xaeA\x94\x12\x91B\x10\x80\xd1\xd2\x84\x10k\xc2\xfb\x88/i\xd1\x13a\xc7R\x99\xc6\xf0\x06\x8c\x1dd\x93e\xc9\xaa\xe4N\xfe\xecu\x1c\x848,\xcff\xdf\xad\xb5L\xbcQ\xf2(\x8aFw\xe3D\x8ez\xac[o\x9b\xf0rY\x02\xb0\x1b\xd25\xf4@^V\x94F\xcd\xd2\xe3\x9e\xb5\xcfK\xd7\xcfm\xc2\xb0?u\xdb\xa6w\x9b\xa7A&\x8d\xb7\x16\x14\xd8\xf5D\tdZ\xb8\xedRD\xd9\xa1\x988\xee\xd8\xf9\xf4\x8f{t>\xb1\xd2\xc6S\\\xa9\xcd@\xe2R\xfa\xca\xe5\xec\xdaF\xc0{\x18\x8e\x8d\xc3\xfb=.\xc3\x12\xec,\x90a(L\xd3\x9a\xac&\x8b\x9b<\xfb\x07\r3\xda[";
 
+    const COMPRESSED_BLOB_MULTI_BLOCK: &[u8] = b"\x78\x01\x4a\xca\xc9\x4f\x52\x30\x35\x62\x28\x4a\x2c\x2e\x48\x4a\x2d\x2a\xaa\x54\x28\x2e\x29\x4a\x2c\x87\x30\xd3\x8b\x12\x0b\x52\x15\x12\x0b\x0a\x72\x52\x15\x0a\x32\xf3\x52\x21\xac\xa4\x9c\xd2\x54\xb0\x3c\x20\x00\x00\xff\xff\x9d\x9c\x16\xa1";
+
     #[test]
     fn test_adler32_empty() {
         let input = b"";
@@ -1029,6 +1029,20 @@ mod tests {
         assert_eq!(b"42", uncompressed_42.as_slice());
         let (uncompressed_blob, _) = inflate(&COMPRESSED_GIT_BLOB_FIXED[2..]).unwrap();
         assert_eq!(b"blob 12\x00* text=auto\n", uncompressed_blob.as_slice());
+    }
+
+    #[test]
+    fn test_inflate_multi_block() {
+        let (uncompressed_42, _) = inflate(&COMPRESSED_42_FIXED[2..]).unwrap();
+        assert_eq!(b"42", uncompressed_42.as_slice());
+        let (uncompressed_blob, _) = inflate(&COMPRESSED_GIT_BLOB_FIXED[2..]).unwrap();
+        assert_eq!(b"blob 12\x00* text=auto\n", uncompressed_blob.as_slice());
+
+        let (uncompressed_blob, _) = inflate(&COMPRESSED_BLOB_MULTI_BLOCK[2..]).unwrap();
+        assert_eq!(
+            b"blob 52\x00raspberry strawberry grape apple pineapple blueberry",
+            uncompressed_blob.as_slice()
+        );
     }
 
     #[test]
