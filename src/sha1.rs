@@ -1,3 +1,5 @@
+use anyhow::ensure;
+
 #[inline]
 fn bitwise_interleave(mask: u32, x: u32, y: u32) -> u32 {
     // Ch in FIPS.180-4
@@ -100,6 +102,25 @@ pub fn sha1(message: &[u8]) -> Digest {
 #[inline]
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x?}")).collect()
+}
+
+#[inline]
+pub fn hex_decode(hex: &str) -> anyhow::Result<Digest> {
+    ensure!(
+        hex.len() >= 40,
+        "not enough bytes to decode this string into a 160 bit hash"
+    );
+    ensure!(
+        hex.as_bytes().iter().all(|byte| {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(byte) || (b'A'..=b'F').contains(byte)
+        }),
+        "invalid characters in {hex}: only 0..9 and a..f/A..F allowed"
+    );
+    let mut result = vec![];
+    for hex_byte in hex.as_bytes()[0..40].chunks(2) {
+        result.push(u8::from_str_radix(str::from_utf8(hex_byte).unwrap(), 16).unwrap())
+    }
+    Ok(result[0..20].try_into().unwrap())
 }
 
 #[cfg(test)]

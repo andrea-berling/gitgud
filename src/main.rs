@@ -8,6 +8,9 @@ use anyhow::Context;
 use anyhow::Ok;
 use clap::{Parser, Subcommand};
 use git::FromSha1Hex;
+use git::HasPayload;
+use git::SerializeToGitObject;
+use sha1::hex_encode;
 
 mod git;
 mod sha1;
@@ -159,7 +162,23 @@ fn main() -> anyhow::Result<()> {
             parent,
             message,
         } => {
-            todo!()
+            let commit_object = git::Commit::new(
+                sha1::hex_decode(tree_sha)
+                    .context(format!("decoding {tree_sha} into a SHA1 digest"))?,
+                if let Some(parent) = parent {
+                    vec![sha1::hex_decode(parent)
+                        .context(format!("decoding {parent} into a SHA1 digest"))?]
+                } else {
+                    vec![]
+                },
+                message.clone(),
+            );
+            let digest = hex_encode(&commit_object.digest());
+            commit_object
+                .serialize(&git_dir)
+                .context(format!("serializing commit object {digest}",))?;
+            println!("{digest}");
+            Ok(())
         }
     }
 }

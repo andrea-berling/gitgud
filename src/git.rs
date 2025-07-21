@@ -7,6 +7,10 @@ const GIT_DIRECTORY_NAME: &str = ".git";
 const OBJECTS_DIRECTORY: &str = "objects";
 const BLOB_HEADER_KEYWORD: &[u8] = b"blob";
 const TREE_HEADER_KEYWORD: &[u8] = b"tree";
+const COMMIT_HEADER_KEYWORD: &[u8] = b"commit";
+const PARENT_HEADER_KEYWORD: &[u8] = b"parent";
+const AUTHOR_HEADER_KEYWORD: &[u8] = b"author";
+const COMMITTER_HEADER_KEYWORD: &[u8] = b"committer";
 
 use anyhow::{bail, ensure, Context};
 use faccess::PathExt;
@@ -19,6 +23,66 @@ use crate::{
 #[derive(Debug)]
 pub struct Blob {
     bytes: Vec<u8>,
+}
+
+pub trait HasPayload {
+    fn payload(&self) -> Vec<u8>;
+
+    fn digest(&self) -> sha1::Digest {
+        sha1::sha1(&self.payload())
+    }
+}
+
+impl HasPayload for Blob {
+    fn payload(&self) -> Vec<u8> {
+        let mut object_bytes = Vec::from(BLOB_HEADER_KEYWORD);
+        object_bytes.push(b' ');
+        object_bytes.extend(self.bytes.len().to_string().as_bytes());
+        object_bytes.push(b'\x00');
+        object_bytes.extend(&self.bytes);
+        object_bytes
+    }
+}
+
+pub trait SerializeToGitObject {
+    fn serialize(&self, git_dir_path: &Path) -> anyhow::Result<()>;
+}
+
+impl<T: HasPayload> SerializeToGitObject for T {
+    fn serialize(&self, git_dir_path: &Path) -> anyhow::Result<()> {
+        let payload = self.payload();
+        let object_sha = sha1::hex_encode(&sha1::sha1(&payload));
+        let dir_name = object_sha.get(0..2).ok_or(anyhow::anyhow!(format!(
+            "hex digest {object_sha} too short (less than 2 chars)"
+        )))?;
+        let object_dir = git_dir_path.join(OBJECTS_DIRECTORY).join(dir_name);
+        if !object_dir.as_path().exists() {
+            std::fs::create_dir(&object_dir).context(format!(
+                "creating dir {:?} for serialization of {object_sha}",
+                object_dir.to_str()
+            ))?;
+        }
+        let file_path = object_dir.join(object_sha.get(2..40).ok_or(anyhow::anyhow!(format!(
+            "hex digest {object_sha} too short (less than 40 chars)"
+        )))?);
+        if !file_path.exists() {
+            let mut stream = zlib::Stream::new(
+                zlib::CompressionMethod::DEFLATE(2 << 7),
+                None,
+                zlib::CompressionLevel::Lowest,
+                payload,
+            );
+            let compressed_payload = stream
+                .deflate()
+                .context(format!("compressing payload for {object_sha}",))?;
+
+            std::fs::write(&file_path, compressed_payload).context(format!(
+                "writing payload for {object_sha} to {:?}",
+                file_path.to_str()
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 pub trait Deserialize
@@ -66,54 +130,6 @@ impl<T: Deserialize> FromSha1Hex for T {
 impl Blob {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    fn payload(&self) -> Vec<u8> {
-        let mut object_bytes = Vec::from(BLOB_HEADER_KEYWORD);
-        object_bytes.push(b' ');
-        object_bytes.extend(self.bytes.len().to_string().as_bytes());
-        object_bytes.push(b'\x00');
-        object_bytes.extend(&self.bytes);
-        object_bytes
-    }
-
-    pub fn digest(&self) -> sha1::Digest {
-        sha1::sha1(&self.payload())
-    }
-
-    pub fn serialize(&self, git_dir_path: &Path) -> Result<(), anyhow::Error> {
-        let payload = self.payload();
-        let object_sha = sha1::hex_encode(&sha1::sha1(&payload));
-        let dir_name = object_sha.get(0..2).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 2 chars)"
-        )))?;
-        let object_dir = git_dir_path.join(OBJECTS_DIRECTORY).join(dir_name);
-        if !object_dir.as_path().exists() {
-            std::fs::create_dir(&object_dir).context(format!(
-                "creating dir {:?} for serialization of {object_sha}",
-                object_dir.to_str()
-            ))?;
-        }
-        let file_path = object_dir.join(object_sha.get(2..40).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 40 chars)"
-        )))?);
-        if !file_path.exists() {
-            let mut stream = zlib::Stream::new(
-                zlib::CompressionMethod::DEFLATE(2 << 7),
-                None,
-                zlib::CompressionLevel::Lowest,
-                payload,
-            );
-            let compressed_payload = stream
-                .deflate()
-                .context(format!("compressing payload for {object_sha}",))?;
-
-            std::fs::write(&file_path, compressed_payload).context(format!(
-                "writing payload for {object_sha} to {:?}",
-                file_path.to_str()
-            ))?;
-        }
-        Ok(())
     }
 
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
@@ -438,9 +454,80 @@ impl Deserialize for Tree {
 }
 
 #[derive(Debug)]
+pub struct Commit {
+    tree: sha1::Digest,
+    parents: Vec<sha1::Digest>,
+    author: String,
+    committer: String,
+    message: String,
+}
+
+impl Commit {
+    pub fn new(tree: sha1::Digest, parents: Vec<sha1::Digest>, message: String) -> Self {
+        Self {
+            tree,
+            parents,
+            author: "Nobody".into(),
+            committer: "Nobody".into(),
+            message,
+        }
+    }
+}
+
+impl HasPayload for Commit {
+    fn payload(&self) -> Vec<u8> {
+        let mut object_bytes = Vec::from(COMMIT_HEADER_KEYWORD);
+        object_bytes.push(b' ');
+        let mut payload = vec![];
+        payload.extend(TREE_HEADER_KEYWORD);
+        payload.push(b' ');
+        payload.extend(hex_encode(&self.tree).bytes());
+        payload.push(b'\n');
+        if !self.parents.is_empty() {
+            payload.extend(PARENT_HEADER_KEYWORD);
+            payload.push(b' ');
+            payload.extend(
+                self.parents
+                    .iter()
+                    .map(|parent| hex_encode(parent))
+                    .reduce(|acc, el| acc + " " + &el)
+                    .unwrap()
+                    .bytes(),
+            );
+            payload.push(b'\n');
+        }
+        payload.extend(AUTHOR_HEADER_KEYWORD);
+        payload.push(b' ');
+        payload.extend(self.author.bytes());
+        payload.push(b' ');
+        payload.push(b'0');
+        payload.push(b' ');
+        payload.extend(b"+0200");
+        payload.push(b'\n');
+        payload.extend(COMMITTER_HEADER_KEYWORD);
+        payload.push(b' ');
+        payload.extend(self.committer.bytes());
+        payload.push(b' ');
+        payload.push(b'0');
+        payload.push(b' ');
+        payload.extend(b"+0200");
+        payload.push(b'\n');
+        payload.push(b'\n');
+        payload.extend(self.message.bytes());
+        payload.push(b'\n');
+
+        object_bytes.extend(payload.len().to_string().as_bytes());
+        object_bytes.push(b'\x00');
+        object_bytes.append(&mut payload);
+        object_bytes
+    }
+}
+
+#[derive(Debug)]
 pub enum Object {
     Blob(Blob),
     Tree(Tree),
+    Commit(Commit),
 }
 
 impl Object {
@@ -448,6 +535,7 @@ impl Object {
         match self {
             Object::Blob(blob) => blob.digest(),
             Object::Tree(tree) => tree.digest(),
+            Object::Commit(commit) => commit.digest(),
         }
     }
 
@@ -455,6 +543,7 @@ impl Object {
         match self {
             Object::Blob(blob) => blob.serialize(git_dir_path),
             Object::Tree(tree) => tree.serialize(object_path, git_dir_path),
+            Object::Commit(commit) => commit.serialize(git_dir_path),
         }
     }
 
