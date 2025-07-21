@@ -50,6 +50,18 @@ enum Command {
     },
     /// Write the current working directory to a new tree object
     WriteTree,
+    /// Write the given tree into a new commit object using the given message and optional parent
+    /// commit
+    CommitTree {
+        /// The tree object to use as the commit root
+        tree_sha: String,
+        /// The parent commit
+        #[arg(short = 'p')]
+        parent: Option<String>,
+        /// The commit message
+        #[arg(short = 'm')]
+        message: String,
+    },
     /// Print zlib metadata from a file
     ZlibMetadata {
         /// The file to read
@@ -141,6 +153,13 @@ fn main() -> anyhow::Result<()> {
                 .context("serializing tree for current directory")?;
             println!("{}", sha1::hex_encode(&tree.digest()));
             Ok(())
+        }
+        Command::CommitTree {
+            tree_sha,
+            parent,
+            message,
+        } => {
+            todo!()
         }
     }
 }

@@ -222,16 +222,16 @@ impl<'a> LSBBitsIterator<'a> {
         Some(bit)
     }
 
-    // Reads `n` bits from the stream LSB-first (no more than 8).
-    fn pop_bits(&mut self, n: usize) -> Option<u8> {
-        if n > 8 {
+    // Reads `n` bits from the stream LSB-first (no more than 16).
+    fn pop_bits(&mut self, n: usize) -> Option<u16> {
+        if n > 16 {
             return None;
         }
         if self.buffer.len() * 8 < self.bits_read_so_far + n {
             return None;
         }
 
-        let mut result = 0u8;
+        let mut result = 0u16;
         let mut bits_written = 0;
 
         while bits_written < n {
@@ -244,11 +244,11 @@ impl<'a> LSBBitsIterator<'a> {
             let chunk = self.buffer[byte_pos] >> shiftr;
 
             // Mask out just the bits we want
-            let mask = (1u8 << bits_to_read_from_byte) - 1;
+            let mask = ((1u16 << bits_to_read_from_byte) - 1) as u8;
             let masked_chunk = chunk & mask;
 
             // Place the chunk into the result at the correct position
-            result |= masked_chunk << bits_written;
+            result |= (masked_chunk as u16) << bits_written;
 
             // Advance cursors
             self.bits_read_so_far += bits_to_read_from_byte;
@@ -258,10 +258,10 @@ impl<'a> LSBBitsIterator<'a> {
         Some(result)
     }
 
-    fn pop_reversed_bits(&mut self, n: usize) -> Option<u8> {
+    fn pop_reversed_bits(&mut self, n: usize) -> Option<u16> {
         let val = self.pop_bits(n)?;
         // For u8, it would be .reverse_bits() >> (8 - n)
-        Some(val.reverse_bits() >> (8 - n))
+        Some(val.reverse_bits() >> (16 - n))
     }
 
     fn bit_cursor(&self) -> usize {
@@ -412,7 +412,9 @@ fn get_code_lengths_decoder(
     // There are n_lengths in the input each represented as 3 bits in LSB order. The remaining 19 -
     // n_lengths are 0
     for code_length_code_length in code_lengths_codes_lengths.iter_mut().take(n_lengths) {
-        *code_length_code_length = lsb_iterator.pop_bits(3).context("not enough bits")? as usize;
+        *code_length_code_length = lsb_iterator
+            .pop_bits(3)
+            .context("reading encoded code length")? as usize;
     }
     // Codes with a length of 0 don't partake in the Huffman encoding and should be removed before
     // constructing the Huffman tree
@@ -468,7 +470,7 @@ fn get_decoders_from_encoded_lengths(
                     };
                 let extra_bits = lsb_iterator
                     .pop_bits(n_extra_bits)
-                    .context("not enough bits")? as usize;
+                    .context(format!("reading {n_extra_bits} for the number of repetitions expressed by code length literal {code_len}"))? as usize;
                 let val_to_repeat = if code_len == REPEAT_LAST_CODE_LEN {
                     decoded_lengths.last().copied().unwrap()
                 } else {
@@ -565,9 +567,9 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 lsb_iterator.bit_cursor()
             )
         };
-        let Some(block_type) = lsb_iterator.pop_bits(2).map(|x| x.into()) else {
+        let Some(block_type) = lsb_iterator.pop_bits(2).map(|x| (x as u8).into()) else {
             bail!(
-                "missing bfinal bit at position {}",
+                "missing btype bits at position {}",
                 lsb_iterator.bit_cursor()
             )
         };
@@ -594,52 +596,61 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                     )
                 ))?);
             }
-            BlockType::FixedHuffmanCodes => loop {
-                let compressed_block_literal = lsb_iterator
-                    .huffman_decode(&fixed_huffman_decompressor)
-                    .context("decoding bits with the fixed huffman decoder")?;
-                match compressed_block_literal {
-                    0..=255 => result.push(compressed_block_literal as u8),
-                    256 => break, // end of block
-                    257..=285 => {
-                        // length + distance
-                        let extra_bits = lsb_iterator
-                            .pop_bits(n_extra_bits_for_len_code(compressed_block_literal)?)
-                            .ok_or(anyhow::anyhow!("not enough bits"))?;
-                        let len =
-                            len_code_to_first_len(compressed_block_literal)? + extra_bits as u16;
-                        let distance_code = lsb_iterator
-                            .pop_reversed_bits(5)
-                            .ok_or(anyhow::anyhow!("not enough bits"))?;
-                        let extra_bits = lsb_iterator
-                            .pop_bits(n_extra_bits_for_distance_code(distance_code as u16)?)
-                            .ok_or(anyhow::anyhow!("not enough bits"))?;
-                        let distance = distance_code_to_first_distance(distance_code as u16)?
-                            + extra_bits as u16;
-                        for _ in 0..len {
-                            result.push(result[result.len() - distance as usize]);
+            BlockType::FixedHuffmanCodes => {
+                loop {
+                    let compressed_block_literal = lsb_iterator
+                        .huffman_decode(&fixed_huffman_decompressor)
+                        .context("decoding bits with the fixed huffman decoder")?;
+                    match compressed_block_literal {
+                        0..=255 => result.push(compressed_block_literal as u8),
+                        256 => break, // end of block
+                        257..=285 => {
+                            let n_extra_bits_for_len =
+                            n_extra_bits_for_len_code(compressed_block_literal).context(format!("computing number of needed bits after len code {compressed_block_literal}"))?;
+                            // length + distance
+                            let extra_bits = lsb_iterator
+                            .pop_bits(n_extra_bits_for_len)
+                            .ok_or(anyhow::anyhow!(format!("not enough bits: after {compressed_block_literal} at {} expected {n_extra_bits_for_len} more bits", lsb_iterator.bit_cursor())))?;
+                            let len = len_code_to_first_len(compressed_block_literal)?
+                                + extra_bits as u16;
+                            let distance_code = lsb_iterator
+                                .pop_reversed_bits(5)
+                                .ok_or(anyhow::anyhow!("not enough bits: after len at {} expected 5 bits for the distance code", lsb_iterator.bit_cursor()))?;
+                            let n_extra_bits_for_distance =
+                            n_extra_bits_for_distance_code(distance_code as u16).context(format!("computing number of needed bits after distance code {distance_code}"))?;
+                            let extra_bits = lsb_iterator
+                                .pop_bits(n_extra_bits_for_distance)
+                                .ok_or(anyhow::anyhow!("not enough bits: after distance code {distance_code} at {} expected {n_extra_bits_for_distance} more bits", lsb_iterator.bit_cursor()))?;
+                            let distance = distance_code_to_first_distance(distance_code as u16)?
+                                + extra_bits as u16;
+                            for _ in 0..len {
+                                result.push(result[result.len() - distance as usize]);
+                            }
                         }
+                        _ => bail!(
+                            "invalid sequence of bits encountered at {}",
+                            lsb_iterator.bit_cursor()
+                        ),
                     }
-                    _ => bail!("invalid sequence of bits encountered"),
                 }
-            },
+            }
             // RFC 1951 section 3.2.7
             BlockType::DynamicHuffmanCodes => {
-                let n_literals_codes = lsb_iterator
-                    .pop_bits(5)
-                    .ok_or(anyhow::anyhow!("not enough bits"))?
-                    as usize
+                let n_literals_codes = lsb_iterator.pop_bits(5).ok_or(anyhow::anyhow!(
+                    "not enough bits: expected 5 bits at {} for HLIT",
+                    lsb_iterator.bit_cursor()
+                ))? as usize
                     + 257;
-                let n_distance_codes = lsb_iterator
-                    .pop_bits(5)
-                    .ok_or(anyhow::anyhow!("not enough bits"))?
-                    as usize
+                let n_distance_codes = lsb_iterator.pop_bits(5).ok_or(anyhow::anyhow!(
+                    "not enough bits: expected 5 bits at {} for HDIST",
+                    lsb_iterator.bit_cursor()
+                ))? as usize
                     + 1;
 
-                let n_code_lengths_codes = lsb_iterator
-                    .pop_bits(4)
-                    .ok_or(anyhow::anyhow!("not enough bits"))?
-                    as usize
+                let n_code_lengths_codes = lsb_iterator.pop_bits(4).ok_or(anyhow::anyhow!(
+                    "not enough bits: expected 4 bits at {} for HCLEN",
+                    lsb_iterator.bit_cursor()
+                ))? as usize
                     + 4;
 
                 let code_lengths_huffman_decoder =
@@ -657,26 +668,31 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                         .huffman_decode(&literals_decoder)
                         .context("decoding dynamic literals")?;
                     match compressed_block_literal {
-                        0..=255 => result.push(compressed_block_literal as u8),
+                        0..=255 => {
+                            result.push(compressed_block_literal as u8);
+                        }
                         256 => break, // end of block
                         257..=285 => {
                             let Some(distances_decoder) = &distances_decoder else {
                                 bail!("found an encoded (length,distance) pair without a distance huffman encoding at the start of the block")
                             };
+                            let n_extra_bits_for_len =
+                            n_extra_bits_for_len_code(compressed_block_literal).context(format!("computing number of needed bits after len code {compressed_block_literal}"))?;
                             // length + distance
                             let extra_bits = lsb_iterator
-                                .pop_bits(n_extra_bits_for_len_code(compressed_block_literal)?)
-                                .ok_or(anyhow::anyhow!("not enough bits"))?;
-                            let len = len_code_to_first_len(compressed_block_literal)?
-                                + extra_bits as u16;
+                                .pop_bits(n_extra_bits_for_len)
+                                .ok_or(anyhow::anyhow!(format!("not enough bits: after {compressed_block_literal} at {} expected {n_extra_bits_for_len} more bits", lsb_iterator.bit_cursor())))?;
+                            let len = len_code_to_first_len(compressed_block_literal)? + extra_bits;
                             let distance_code = lsb_iterator
                                 .huffman_decode(distances_decoder)
                                 .context("decoding dynamic distances")?;
+                            let n_extra_bits_for_distance =
+                            n_extra_bits_for_distance_code(distance_code).context(format!("computing number of needed bits after distance code {distance_code}"))?;
                             let extra_bits = lsb_iterator
-                                .pop_bits(n_extra_bits_for_distance_code(distance_code)?)
-                                .ok_or(anyhow::anyhow!("not enough bits"))?;
+                                .pop_bits(n_extra_bits_for_distance)
+                                .ok_or(anyhow::anyhow!("not enough bits: after distance code {distance_code} at {} expected {n_extra_bits_for_distance} more bits", lsb_iterator.bit_cursor()))?;
                             let distance =
-                                distance_code_to_first_distance(distance_code)? + extra_bits as u16;
+                                distance_code_to_first_distance(distance_code)? + extra_bits;
                             for _ in 0..len {
                                 result.push(result[result.len() - distance as usize]);
                             }
@@ -859,19 +875,21 @@ fn n_extra_bits_for_distance_code(code: u16) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
-    const COMPRESSED_HELLO: [u8; 17] =
-        *b"\x78\x01\x01\x05\x00\xfa\xff\x68\x65\x6c\x6c\x6f\x06\x2c\x02\x15\x0a";
+    const COMPRESSED_HELLO: &[u8] =
+        b"\x78\x01\x01\x05\x00\xfa\xff\x68\x65\x6c\x6c\x6f\x06\x2c\x02\x15\x0a";
 
-    const COMPRESSED_42_FIXED: [u8; 10] = *b"\x78\x01\x33\x31\x02\x00\x00\x9c\x00\x67";
-    const COMPRESSED_GIT_BLOB_FIXED: [u8; 28] = [
+    const COMPRESSED_42_FIXED: &[u8] = b"\x78\x01\x33\x31\x02\x00\x00\x9c\x00\x67";
+    const COMPRESSED_GIT_BLOB_FIXED: &[u8] = &[
         0x78, 0x1, 0x4b, 0xca, 0xc9, 0x4f, 0x52, 0x30, 0x34, 0x62, 0xd0, 0x52, 0x28, 0x49, 0xad,
         0x28, 0xb1, 0x4d, 0x2c, 0x2d, 0xc9, 0xe7, 0x2, 0x0, 0x3f, 0x6f, 0x6, 0x32,
     ];
 
-    const COMPRESSED_GIT_TREE_FIXED: [u8; 328] =
-        *b"x\x01+)JMU065`01000P\xd0K\xceOIM.JL+I-*f\xe8\x8b\x9aT\x1a\x19#|\x87e\xd1\xdf\'\xa9\xfbg4u\x8b\x96\xfa\x19\x1a\x18\x98\x99\x98(\xe8\xa5g\x96$\x96\x94\x14e&\x95\x96\xa4\x163\x88g\xb9\xf6Oy\xf0*\xa8\xe8\\\xfa\xe1\xec\xcf\xdc\xd9/O}SFR\x99\x99\x9e\x97_\x94\xcaP\xfckC\xd1\xd1\xb5\x7f6\xac(THI\xecS\xe4Y~\xf4\xaa\x03T\x95sbQz\xbe^N~r6\xc3\x81\'\xd2.\x96\x7f\xbf\xe5>\xdf{D \xbe\xcb\x83\x93\xd1:\xbd\x1fEUI~n\x0eC\xfdV\x93\xef\x8b\xb4\xda\xb7\xb2\xae(4\xd8\xaee\xb4h\xe3\xd5u\x0cPUA\xae\x8e.\xbe\xaez\xb9)\x0c\x96\xfc,k\xb7\xc6\xc6\xde\x9afx\x7f\xe25g\x87\x88\x8c\x842_\xa8\"d\x8f\xeaU\xe6\xe604/\xee\xec\x95\x9c\xed[\xb6\xa1z\xf1\xb6#\xcd\xb5\xaf\x92\xddo\x1f\x80\x04JqQ2C\xffS\x81\x1f|\x11y\t\x95Q\xcbEO\x99\x9a^5\x13\tW740075U\xa8\xcc/-\x8a/(\xcaO/J\xcc\xd5+\xce`\xb8\xae\x92\xc1\xa2e\xef\xbeb\xf9|\x97#\x12Z}6>\x0bV\xe4\x00\x00Yg\x8b\x98";
+    const COMPRESSED_GIT_TREE_FIXED: &[u8] =
+        b"x\x01+)JMU065`01000P\xd0K\xceOIM.JL+I-*f\xe8\x8b\x9aT\x1a\x19#|\x87e\xd1\xdf\'\xa9\xfbg4u\x8b\x96\xfa\x19\x1a\x18\x98\x99\x98(\xe8\xa5g\x96$\x96\x94\x14e&\x95\x96\xa4\x163\x88g\xb9\xf6Oy\xf0*\xa8\xe8\\\xfa\xe1\xec\xcf\xdc\xd9/O}SFR\x99\x99\x9e\x97_\x94\xcaP\xfckC\xd1\xd1\xb5\x7f6\xac(THI\xecS\xe4Y~\xf4\xaa\x03T\x95sbQz\xbe^N~r6\xc3\x81\'\xd2.\x96\x7f\xbf\xe5>\xdf{D \xbe\xcb\x83\x93\xd1:\xbd\x1fEUI~n\x0eC\xfdV\x93\xef\x8b\xb4\xda\xb7\xb2\xae(4\xd8\xaee\xb4h\xe3\xd5u\x0cPUA\xae\x8e.\xbe\xaez\xb9)\x0c\x96\xfc,k\xb7\xc6\xc6\xde\x9afx\x7f\xe25g\x87\x88\x8c\x842_\xa8\"d\x8f\xeaU\xe6\xe604/\xee\xec\x95\x9c\xed[\xb6\xa1z\xf1\xb6#\xcd\xb5\xaf\x92\xddo\x1f\x80\x04JqQ2C\xffS\x81\x1f|\x11y\t\x95Q\xcbEO\x99\x9a^5\x13\tW740075U\xa8\xcc/-\x8a/(\xcaO/J\xcc\xd5+\xce`\xb8\xae\x92\xc1\xa2e\xef\xbeb\xf9|\x97#\x12Z}6>\x0bV\xe4\x00\x00Yg\x8b\x98";
 
-    const COMPRESSED_GIT_BLOB_DYNAMIC: &[u8; 221] = b"x\x01\x85\x90\xc1j\xc30\x0c\x86w\xd6S\x08\xe7\\c\'e\xeba\x1d\x83>F\xc8\xc1\x89\x95\xd8\xcc\xb1\x83\xect\xf4\xedGX\x07\x81\x1d\xa2\xab\xa4O\xdf\xaf>\xa4\x1e\xcf\xf5\xdbK\xbb\x98\xe1\xcbL\xd4A43\xe1\x15\xc5\x90,\rl\xc6B\x9cO\x93/\x02\xee\xc4\xd9\xa7\xb85\x95\xd4R\t0kq\x893^\xb1\x15\xb7\xdd<\xbe;\n!}\xee\x19\xd2\xa7\x0f\xd1\x01Y_\x9e\x90Z\xd5Z\x00\xaf\xb9\x9cvh-/J\x00\xb4\x96\x16\x8a\x96\xe2\xe0)w`\xe2\xc3\xa5\xef\xed\xb4\x96J\xbe^\x04\x1eT\x85\xc4\x9c\x18\x9d\x896\xf88A\xff(\xb4\x99\n-\x1b\xa9\x0e\xf7\x11+t\x14\x96\x8c\xb3\x89f\"\xec\xd7q$\xce0\x06S\xa8\xfe3i\xce\x87\xa4\n\x874/Ly{\x1e\x14\xe7\xf3\xaf\xd93Ks\x90\xe5_\x90\x1f>\xc7qb";
+    const COMPRESSED_GIT_BLOB_DYNAMIC: &[u8] = b"x\x01\x85\x90\xc1j\xc30\x0c\x86w\xd6S\x08\xe7\\c\'e\xeba\x1d\x83>F\xc8\xc1\x89\x95\xd8\xcc\xb1\x83\xect\xf4\xedGX\x07\x81\x1d\xa2\xab\xa4O\xdf\xaf>\xa4\x1e\xcf\xf5\xdbK\xbb\x98\xe1\xcbL\xd4A43\xe1\x15\xc5\x90,\rl\xc6B\x9cO\x93/\x02\xee\xc4\xd9\xa7\xb85\x95\xd4R\t0kq\x893^\xb1\x15\xb7\xdd<\xbe;\n!}\xee\x19\xd2\xa7\x0f\xd1\x01Y_\x9e\x90Z\xd5Z\x00\xaf\xb9\x9cvh-/J\x00\xb4\x96\x16\x8a\x96\xe2\xe0)w`\xe2\xc3\xa5\xef\xed\xb4\x96J\xbe^\x04\x1eT\x85\xc4\x9c\x18\x9d\x896\xf88A\xff(\xb4\x99\n-\x1b\xa9\x0e\xf7\x11+t\x14\x96\x8c\xb3\x89f\"\xec\xd7q$\xce0\x06S\xa8\xfe3i\xce\x87\xa4\n\x874/Ly{\x1e\x14\xe7\xf3\xaf\xd93Ks\x90\xe5_\x90\x1f>\xc7qb";
+
+    const COMPRESSED_GIT_COMMIT_DYNAMIC: &[u8] = b"x\x01\xad\x94MO\xdc0\x10\x86{\xce\xaf\x98S\x05\x94\r\xd9e?QU\x15\xe8\x07H\xadz\x00\xce\xb5=\x9e$.\x89\xbd\xb2\'\xc0\xf6\xd7Wv\xb2\xcb\x828\xf6\x14y\x9c\xbc3\xf3\xbc3A\xd7\xb6\x86a<-&\xef\xd8\x13\xc1\\/Vr\xa9\n\x9c\x16j\xb9\x9a\xc9\xc9\xa2\x9c\x95\n\xb5\x9a\xce\x968Y\x15j*O\xd5XR\xb6\x96\x9e,\xc3b\xa2\xd5\xaa\x9c\x11\xcdQ\xa9\xf9\xb2\x18#\xaa\xf1).K\xc4\xf9j>\xd7KU.f\xb8\\d\xb2\xe3\xday8\xb7\xda\x93\x84\x0b\xf2\x8d\xb1\x95!o\xe0\xa3L\xb1\x91\xeac\x9f\xbb@>\xe4\xd6yZ7\x9b\xbc2\\w*G\xd7~\x82\xf1bv:.V\xab\xe9\x0c>\x14\x93\xa2\xc80\x95\xcf\xf4\xbfu\xb3\x92$\x9f\xc1u\xbbn\xa8\x8dm~7\x0cN\xfd!d\xa8\xa5\xd5\xb1v\x90V\x83x\xf4\x86i\x14\xd1\t\x88\xd5H\xab\xb3\xec\xda\xb2w\xbaC\n1\xb6\xf6T\x93\r\xe6\x81\xde\x94)\x9d\x07\xd58\x15\x92`T\n\xc7\x99\xb1\xd8t:f\t\xe4\x8dl\xcc_\xc9\xc6\xd9c\xd0\xf4*\x10\xab\xb8\xb9:\x1f\x8d\xa1\x96\xa16\xb6\xca\xe1\xb66!\xf3TJd\xe7\xa3\x06\x92e\x1fE(l\xbbh\\e\x10\x1e\r\xd7\xc6\x82\x08\x1eO*\xc3\xb9\x0f\"\t\x1a\xcbTy\xc9\x142\xc3\xf1\xe4\x80k\x82V\x1a\x0b\x97?\xae\xb7\x9d\x86<\xcbFpt\xb4\xff\xfd\xd1\xd1Y\x06\x000\x82s\xadI\x83\xb8h\x9c\x12\xc7 n#\xa3\xe1\xf9\xd5\xb2\xdf\xbc8\xfct:\xde&\xa6\xbf\x12h\x91d\x00\x02\xfb\x0e9\x9c\x90\xed\xda\x90hyZ{\nd9\xf6\xf6\xecL\xc8\x87\xc4;\xdbb\xfa/;`\xd4\xf7&\xbey\xd7\xde\xd4r|EO\x02\xd8K\xc3\xbdl\xef\xef\x90\xf5\x15g(\xbdk\xf78\xd3.Y\xdfeK\\;\xbd\xaf\xf3\xd288\x10[\xdfH\x1c\x1e\x0fJ\xdaT\x14\xb6\x19Q6\xd85\xc9f8\x10\xfdU|5\"AO\xfdE*\xa34\r\xc1Zr\x1d\x86b\x0fD\x8c\xff\x8e!q\xb8\xa5p\xc7&:\xaeA\x94\x12\x91B\x10\x80\xd1\xd2\x84\x10k\xc2\xfb\x88/i\xd1\x13a\xc7R\x99\xc6\xf0\x06\x8c\x1dd\x93e\xc9\xaa\xe4N\xfe\xecu\x1c\x848,\xcff\xdf\xad\xb5L\xbcQ\xf2(\x8aFw\xe3D\x8ez\xac[o\x9b\xf0rY\x02\xb0\x1b\xd25\xf4@^V\x94F\xcd\xd2\xe3\x9e\xb5\xcfK\xd7\xcfm\xc2\xb0?u\xdb\xa6w\x9b\xa7A&\x8d\xb7\x16\x14\xd8\xf5D\tdZ\xb8\xedRD\xd9\xa1\x988\xee\xd8\xf9\xf4\x8f{t>\xb1\xd2\xc6S\\\xa9\xcd@\xe2R\xfa\xca\xe5\xec\xdaF\xc0{\x18\x8e\x8d\xc3\xfb=.\xc3\x12\xec,\x90a(L\xd3\x9a\xac&\x8b\x9b<\xfb\x07\r3\xda[";
 
     #[test]
     fn test_adler32_empty() {
@@ -1015,11 +1033,13 @@ mod tests {
 
     #[test]
     fn test_stream_inflate() {
-        let mut stream: Stream = COMPRESSED_GIT_TREE_FIXED.as_slice().try_into().unwrap();
+        let mut stream: Stream = COMPRESSED_GIT_TREE_FIXED.try_into().unwrap();
         // Output is too big to compare directly, just interested in whether inflating and
         // verifying the checksum works without panicking
         stream.inflate().unwrap();
-        stream = COMPRESSED_GIT_BLOB_DYNAMIC.as_slice().try_into().unwrap();
+        stream = COMPRESSED_GIT_BLOB_DYNAMIC.try_into().unwrap();
+        stream.inflate().unwrap();
+        stream = COMPRESSED_GIT_COMMIT_DYNAMIC.try_into().unwrap();
         stream.inflate().unwrap();
     }
 }
