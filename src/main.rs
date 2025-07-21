@@ -1,25 +1,72 @@
-use std::env;
 use std::fs;
 use std::io::stdout;
 use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::bail;
-use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Ok;
+use clap::{Parser, Subcommand};
 
 mod git;
 mod sha1;
 mod zlib;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Initialize a new git repository
+    Init,
+    /// Provide content or type and size information for repository objects
+    CatFile {
+        /// Pretty-print the contents of <object> based on its type
+        #[arg(short = 'p')]
+        pretty_print: bool,
+        /// The object to display
+        object: String,
+    },
+    /// Compute object ID and optionally creates a blob from a file
+    HashObject {
+        /// Write the new object into the object database
+        #[arg(short = 'w')]
+        write: bool,
+        /// Read object from <file>
+        file: String,
+    },
+    /// List the contents of a tree object
+    LsTree {
+        /// Show only filenames, not the mode, object type, and SHA-1 of the object.
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// The tree object to list
+        tree_sha: String,
+    },
+    /// Print zlib metadata from a file
+    ZlibMetadata {
+        /// The file to read
+        file: String,
+    },
+    /// Inflate a zlib compressed file
+    ZlibInflate {
+        /// The file to inflate
+        file: String,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
 
     // Uncomment this block to pass the first stage
-    let args: Vec<String> = env::args().collect();
-    match args[1].as_str() {
-        "init" => {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Init => {
             fs::create_dir(".git").unwrap();
             fs::create_dir(".git/objects").unwrap();
             fs::create_dir(".git/refs").unwrap();
@@ -27,9 +74,14 @@ fn main() -> anyhow::Result<()> {
             println!("Initialized git directory");
             Ok(())
         }
-        "cat-file" => {
-            ensure!(args[2] == "-p");
-            let object_sha = &args[3];
+        Command::CatFile {
+            pretty_print,
+            object,
+        } => {
+            if !pretty_print {
+                bail!("cat-file currently only supports the -p option");
+            }
+            let object_sha = object;
             let file_bytes = fs::read(PathBuf::from_iter([
                 ".git",
                 "objects",
@@ -49,9 +101,11 @@ fn main() -> anyhow::Result<()> {
             stdout().flush()?;
             Ok(())
         }
-        "hash-object" => {
-            ensure!(args[2] == "-w");
-            let object_filename = &args[3];
+        Command::HashObject { write, file } => {
+            if !write {
+                bail!("hash-object currently only supports the -w option");
+            }
+            let object_filename = file;
             let blob_payload =
                 fs::read(object_filename).context(format!("reading from {object_filename}"))?;
             let object_bytes = [
@@ -82,9 +136,13 @@ fn main() -> anyhow::Result<()> {
             println!("{object_sha}");
             Ok(())
         }
-        "ls-tree" => {
-            ensure!(args[2] == "--name-only");
-            let tree_sha = &args[3];
+        Command::LsTree {
+            name_only,
+            tree_sha,
+        } => {
+            if !name_only {
+                bail!("ls-tree currently only supports the --name-only option");
+            }
             let file_bytes = fs::read(PathBuf::from_iter([
                 ".git",
                 "objects",
@@ -105,23 +163,20 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        "zlib_metadata" => {
-            let bytes = fs::read(&args[2]).context(format!("reading from {}", &args[2]))?;
+        Command::ZlibMetadata { file } => {
+            let bytes = fs::read(file).context(format!("reading from {}", file))?;
             let stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             print!("{stream}");
             Ok(())
         }
-        "zlib_inflate" => {
-            let bytes = fs::read(&args[2]).context(format!("reading from {}", &args[2]))?;
+        Command::ZlibInflate { file } => {
+            let bytes = fs::read(file).context(format!("reading from {}", file))?;
             let mut stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             stdout().write_all(stream.inflate()?)?;
             stdout().flush()?;
             Ok(())
-        }
-        _ => {
-            bail!("unknown command: {}", args[1])
         }
     }
 }

@@ -7,4 +7,5 @@ rust-version = "1.80"
 
 [dependencies]
 anyhow = "1.0.68"                                # error handling
+clap = { version = "4.5.41", features = ["derive"] }
 thiserror = "1.0.38"                             # error handling
