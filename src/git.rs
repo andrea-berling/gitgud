@@ -1,16 +1,19 @@
+use core::fmt::Debug;
 use std::{
+    cmp::min,
     fs::{self},
-    path::Path,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-const GIT_DIRECTORY_NAME: &str = ".git";
-const OBJECTS_DIRECTORY: &str = "objects";
-const BLOB_HEADER_KEYWORD: &[u8] = b"blob";
-const TREE_HEADER_KEYWORD: &[u8] = b"tree";
-const COMMIT_HEADER_KEYWORD: &[u8] = b"commit";
-const PARENT_HEADER_KEYWORD: &[u8] = b"parent";
-const AUTHOR_HEADER_KEYWORD: &[u8] = b"author";
-const COMMITTER_HEADER_KEYWORD: &[u8] = b"committer";
+pub const GIT_DIRECTORY_NAME: &str = ".git";
+pub const OBJECTS_DIRECTORY: &str = "objects";
+pub const BLOB_HEADER_KEYWORD: &[u8] = b"blob";
+pub const TREE_HEADER_KEYWORD: &[u8] = b"tree";
+pub const COMMIT_HEADER_KEYWORD: &[u8] = b"commit";
+pub const PARENT_HEADER_KEYWORD: &[u8] = b"parent";
+pub const AUTHOR_HEADER_KEYWORD: &[u8] = b"author";
+pub const COMMITTER_HEADER_KEYWORD: &[u8] = b"committer";
 
 use anyhow::{bail, ensure, Context};
 use faccess::PathExt;
@@ -20,9 +23,36 @@ use crate::{
     zlib,
 };
 
-#[derive(Debug)]
 pub struct Blob {
     bytes: Vec<u8>,
+}
+
+impl Debug for Blob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Blob")
+            .field("bytes", &{
+                let bytes_start: Vec<_> = self.bytes[..min(10, self.bytes.len())]
+                    .iter()
+                    .map(|byte| format!("{byte:#x}"))
+                    .collect();
+                let bytes_end = if self.bytes().len() > 10 + bytes_start.len() {
+                    self.bytes[self.bytes.len() - 10..]
+                        .iter()
+                        .map(|byte| format!("{byte:#x}"))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                format!(
+                    "[ {}{}{} ]",
+                    bytes_start.join(", "),
+                    if !bytes_end.is_empty() { ", ..., " } else { "" },
+                    bytes_end.join(", ")
+                )
+            })
+            .field("n_bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 pub trait HasPayload {
@@ -48,40 +78,62 @@ pub trait SerializeToGitObject {
     fn serialize(&self, git_dir_path: &Path) -> anyhow::Result<()>;
 }
 
+/// Path to the loose object in the git directory
+pub fn object_path(git_dir_path: &Path, sha: &sha1::Digest) -> anyhow::Result<PathBuf> {
+    let object_sha = sha1::hex_encode(sha);
+    let dir_name = object_sha.get(0..2).ok_or(anyhow::anyhow!(format!(
+        "hex digest {object_sha} too short (less than 2 chars)"
+    )))?;
+    let object_dir = git_dir_path.join(OBJECTS_DIRECTORY).join(dir_name);
+
+    let file_path = object_dir.join(object_sha.get(2..40).ok_or(anyhow::anyhow!(format!(
+        "hex digest {object_sha} too short (less than 40 chars)"
+    )))?);
+    Ok(file_path)
+}
+
+fn write_object(payload: &[u8], git_dir_path: &Path) -> anyhow::Result<()> {
+    let object_sha_digest = sha1::sha1(payload);
+    let object_sha = sha1::hex_encode(&object_sha_digest);
+    let object_path = object_path(git_dir_path, &object_sha_digest)
+        .with_context(|| format!("getting object path for {object_sha}"))?;
+
+    if object_path.exists() {
+        return Ok(());
+    }
+
+    let dir_path = object_path.parent().ok_or_else(|| {
+        anyhow::anyhow!("could not get parent directory for object path {object_path:?}")
+    })?;
+
+    if !dir_path.exists() {
+        std::fs::create_dir(dir_path).context(format!(
+            "creating dir {:?} for serialization of {object_sha}",
+            dir_path.to_str()
+        ))?;
+    }
+
+    let mut stream = zlib::Stream::new(
+        zlib::CompressionMethod::DEFLATE(2 << 7),
+        None,
+        zlib::CompressionLevel::Lowest,
+        payload.to_vec(),
+    );
+    let compressed_payload = stream
+        .deflate()
+        .context(format!("compressing payload for {object_sha}",))?;
+
+    std::fs::write(&object_path, compressed_payload).context(format!(
+        "writing payload for {object_sha} to {:?}",
+        object_path.to_str()
+    ))?;
+
+    Ok(())
+}
+
 impl<T: HasPayload> SerializeToGitObject for T {
     fn serialize(&self, git_dir_path: &Path) -> anyhow::Result<()> {
-        let payload = self.payload();
-        let object_sha = sha1::hex_encode(&sha1::sha1(&payload));
-        let dir_name = object_sha.get(0..2).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 2 chars)"
-        )))?;
-        let object_dir = git_dir_path.join(OBJECTS_DIRECTORY).join(dir_name);
-        if !object_dir.as_path().exists() {
-            std::fs::create_dir(&object_dir).context(format!(
-                "creating dir {:?} for serialization of {object_sha}",
-                object_dir.to_str()
-            ))?;
-        }
-        let file_path = object_dir.join(object_sha.get(2..40).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 40 chars)"
-        )))?);
-        if !file_path.exists() {
-            let mut stream = zlib::Stream::new(
-                zlib::CompressionMethod::DEFLATE(2 << 7),
-                None,
-                zlib::CompressionLevel::Lowest,
-                payload,
-            );
-            let compressed_payload = stream
-                .deflate()
-                .context(format!("compressing payload for {object_sha}",))?;
-
-            std::fs::write(&file_path, compressed_payload).context(format!(
-                "writing payload for {object_sha} to {:?}",
-                file_path.to_str()
-            ))?;
-        }
-        Ok(())
+        write_object(&self.payload(), git_dir_path)
     }
 }
 
@@ -128,6 +180,10 @@ impl<T: Deserialize> FromSha1Hex for T {
 }
 
 impl Blob {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -239,11 +295,21 @@ impl TryFrom<&[u8]> for TreeEntryMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TreeEntry {
     name: String,
     mode: TreeEntryMode,
     sha1: sha1::Digest,
+}
+
+impl Debug for TreeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeEntry")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("sha1", &hex_encode(&self.sha1))
+            .finish()
+    }
 }
 
 impl TreeEntry {
@@ -310,25 +376,6 @@ impl Tree {
         &self.entries
     }
 
-    fn payload(&self) -> Vec<u8> {
-        let mut object_bytes = Vec::from(TREE_HEADER_KEYWORD);
-        object_bytes.push(b' ');
-        let mut payload = vec![];
-        let mut sorted_entries = self.entries().to_vec();
-        sorted_entries.sort_by(|el1, el2| el1.name.cmp(&el2.name));
-        for entry in &sorted_entries {
-            payload.extend(String::from(entry.mode).bytes());
-            payload.push(b' ');
-            payload.extend(entry.name.as_bytes());
-            payload.push(b'\x00');
-            payload.extend(entry.sha1);
-        }
-        object_bytes.extend(payload.len().to_string().as_bytes());
-        object_bytes.push(b'\x00');
-        object_bytes.append(&mut payload);
-        object_bytes
-    }
-
     pub fn digest(&self) -> sha1::Digest {
         sha1::sha1(&self.payload())
     }
@@ -345,38 +392,7 @@ impl Tree {
                 .serialize(&object_path, git_dir_path)
                 .context(format!("serializing {}", hex_encode(&entry.sha1)))?;
         }
-        let payload = self.payload();
-        let object_sha = sha1::hex_encode(&sha1::sha1(&payload));
-        let dir_name = object_sha.get(0..2).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 2 chars)"
-        )))?;
-        let object_dir = git_dir_path.join(OBJECTS_DIRECTORY).join(dir_name);
-        if !object_dir.as_path().exists() {
-            std::fs::create_dir(&object_dir).context(format!(
-                "creating dir {:?} for serialization of {object_sha}",
-                object_dir.to_str()
-            ))?;
-        }
-        let file_path = object_dir.join(object_sha.get(2..40).ok_or(anyhow::anyhow!(format!(
-            "hex digest {object_sha} too short (less than 40 chars)"
-        )))?);
-        if !file_path.exists() {
-            let mut stream = zlib::Stream::new(
-                zlib::CompressionMethod::DEFLATE(2 << 7),
-                None,
-                zlib::CompressionLevel::Lowest,
-                payload,
-            );
-            let compressed_payload = stream
-                .deflate()
-                .context(format!("compressing payload for {object_sha}",))?;
-
-            std::fs::write(&file_path, compressed_payload).context(format!(
-                "writing payload for {object_sha} to {:?}",
-                file_path.to_str()
-            ))?;
-        }
-        Ok(())
+        write_object(&self.payload(), git_dir_path)
     }
 
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
@@ -413,6 +429,27 @@ impl Tree {
             }
         }
         Ok(tree)
+    }
+}
+
+impl HasPayload for Tree {
+    fn payload(&self) -> Vec<u8> {
+        let mut object_bytes = Vec::from(TREE_HEADER_KEYWORD);
+        object_bytes.push(b' ');
+        let mut payload = vec![];
+        let mut sorted_entries = self.entries().to_vec();
+        sorted_entries.sort_by(|el1, el2| el1.name.cmp(&el2.name));
+        for entry in &sorted_entries {
+            payload.extend(String::from(entry.mode).bytes());
+            payload.push(b' ');
+            payload.extend(entry.name.as_bytes());
+            payload.push(b'\x00');
+            payload.extend(entry.sha1);
+        }
+        object_bytes.extend(payload.len().to_string().as_bytes());
+        object_bytes.push(b'\x00');
+        object_bytes.append(&mut payload);
+        object_bytes
     }
 }
 
@@ -453,22 +490,174 @@ impl Deserialize for Tree {
     }
 }
 
-#[derive(Debug)]
+pub struct AuthorshipInfo {
+    name: String,
+    email_address: String,
+    epoch: u64,
+    timezone: i16,
+}
+
+impl Debug for AuthorshipInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorshipInfo")
+            .field("name", &self.name)
+            .field("email_address", &self.email_address)
+            .field("epoch", &self.epoch)
+            .field("timezone", &format!("{:+05}", &self.timezone))
+            .finish()
+    }
+}
+
+impl TryFrom<&[u8]> for AuthorshipInfo {
+    type Error = anyhow::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let start_email_address_marker =
+            bytes
+                .iter()
+                .position(|&b| b == b'<')
+                .ok_or(anyhow::anyhow!(
+                    "no start of email address marker ('<') found"
+                ))?;
+        let name = str::from_utf8(bytes.get(..start_email_address_marker - 1).ok_or(
+            anyhow::anyhow!(
+                "not enough bytes for a name (name is everything before the email address)"
+            ),
+        )?)
+        .context("name is not valid UTF-8")?;
+        let end_email_address_marker = bytes[start_email_address_marker..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|pos| pos + start_email_address_marker)
+            .ok_or(anyhow::anyhow!(
+                "no end of email address marker ('>') found"
+            ))?;
+        let email_address = str::from_utf8(
+            bytes
+                .get(start_email_address_marker + 1..end_email_address_marker)
+                .ok_or(anyhow::anyhow!("not enough bytes for an email address"))?,
+        )
+        .context("email address is not valid UTF-8")?;
+        ensure!(
+            bytes.get(end_email_address_marker + 1) == Some(&b' '),
+            "no space after email address"
+        );
+        let end_epoch_bytes = bytes
+            .get(end_email_address_marker + 2..)
+            .context("not enough bytes for epoch and timezone")?
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|bytes| bytes + end_email_address_marker + 2)
+            .context("no space between epoch and timezone")?;
+        let epoch = str::from_utf8(
+            bytes
+                .get(end_email_address_marker + 2..end_epoch_bytes)
+                .context("not enough bytes for epoch")?,
+        )
+        .context("epoch is not valid UTF-8")?
+        .parse()
+        .context("could not parse epoch")?;
+        let sign: i16 = bytes
+            .get(end_epoch_bytes + 1)
+            .and_then(|&b| {
+                if b == b'+' {
+                    Some(1)
+                } else if b == b'-' {
+                    Some(-1)
+                } else {
+                    None
+                }
+            })
+            .ok_or(anyhow::anyhow!("no sign for timezone"))?;
+        let timezone: i16 = str::from_utf8(
+            bytes
+                .get(end_epoch_bytes + 2..end_epoch_bytes + 6)
+                .context("not enough bytes for timezone")?,
+        )
+        .context("timezone is not valid UTF-8")?
+        .parse()
+        .context("could not parse timezone")?;
+        Ok(Self {
+            name: name.to_string(),
+            email_address: email_address.to_string(),
+            epoch,
+            timezone: timezone * sign,
+        })
+    }
+}
+
+impl From<&AuthorshipInfo> for Vec<u8> {
+    fn from(author: &AuthorshipInfo) -> Self {
+        let mut ret = vec![];
+        ret.extend(author.name.bytes());
+        ret.push(b' ');
+        ret.push(b'<');
+        ret.extend(author.email_address.bytes());
+        ret.push(b'>');
+        ret.push(b' ');
+        ret.extend(author.epoch.to_string().bytes());
+        ret.push(b' ');
+        ret.push(if author.timezone < 0 { b'-' } else { b'+' });
+        ret.extend(format!("{:04}", author.timezone.abs()).bytes());
+        ret
+    }
+}
+
+pub type CommiterInfo = AuthorshipInfo;
+
 pub struct Commit {
     tree: sha1::Digest,
     parents: Vec<sha1::Digest>,
-    author: String,
-    committer: String,
+    author: AuthorshipInfo,
+    committer: CommiterInfo,
     message: String,
 }
 
+impl Debug for Commit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Commit")
+            .field("tree", &hex_encode(&self.tree))
+            .field(
+                "parents",
+                &self
+                    .parents
+                    .iter()
+                    .map(|sha1| hex_encode(sha1))
+                    .reduce(|acc, sha| format!("{acc}, {sha}")),
+            )
+            .field("author", &self.author)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
 impl Commit {
-    pub fn new(tree: sha1::Digest, parents: Vec<sha1::Digest>, message: String) -> Self {
+    pub fn new_no_author_no_committer(
+        tree: sha1::Digest,
+        parents: Vec<sha1::Digest>,
+        message: String,
+    ) -> Self {
         Self {
             tree,
             parents,
-            author: "Nobody".into(),
-            committer: "Nobody".into(),
+            author: AuthorshipInfo {
+                name: "Nobody".into(),
+                email_address: "nobody@nowhere.nil".into(),
+                epoch: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                timezone: 0,
+            },
+            committer: AuthorshipInfo {
+                name: "Nobody".into(),
+                email_address: "nobody@nowhere.nil".into(),
+                epoch: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                timezone: 0,
+            },
             message,
         }
     }
@@ -498,19 +687,11 @@ impl HasPayload for Commit {
         }
         payload.extend(AUTHOR_HEADER_KEYWORD);
         payload.push(b' ');
-        payload.extend(self.author.bytes());
-        payload.push(b' ');
-        payload.push(b'0');
-        payload.push(b' ');
-        payload.extend(b"+0200");
+        payload.extend(&<Vec<u8>>::from(&self.author));
         payload.push(b'\n');
         payload.extend(COMMITTER_HEADER_KEYWORD);
         payload.push(b' ');
-        payload.extend(self.committer.bytes());
-        payload.push(b' ');
-        payload.push(b'0');
-        payload.push(b' ');
-        payload.extend(b"+0200");
+        payload.extend(&<Vec<u8>>::from(&self.committer));
         payload.push(b'\n');
         payload.push(b'\n');
         payload.extend(self.message.bytes());
@@ -520,6 +701,139 @@ impl HasPayload for Commit {
         object_bytes.push(b'\x00');
         object_bytes.append(&mut payload);
         object_bytes
+    }
+}
+
+impl Deserialize for Commit {
+    fn deserialize(bytes: &[u8]) -> anyhow::Result<Self> {
+        ensure!(
+            bytes.starts_with(COMMIT_HEADER_KEYWORD),
+            "wrong header (expected {})",
+            str::from_utf8(COMMIT_HEADER_KEYWORD).expect(
+                "check the definition of COMMIT_HEADER_KEYWORD: should be a UTF8 encoded string"
+            )
+        );
+        ensure!(
+            bytes.get(COMMIT_HEADER_KEYWORD.len()) == Some(&b' '),
+            "expected space after {}, got {:#x?}",
+            str::from_utf8(COMMIT_HEADER_KEYWORD).expect(
+                "check the definition of COMMIT_HEADER_KEYWORD: should be a UTF8 encoded string"
+            ),
+            bytes[COMMIT_HEADER_KEYWORD.len()]
+        );
+        let Some(header_end_marker) = bytes.iter().position(|&x| x == 0) else {
+            bail!("no header end marker (\x00 byte) found")
+        };
+        let len: usize = str::from_utf8(
+            &bytes
+                .get(COMMIT_HEADER_KEYWORD.len() + 1..header_end_marker)
+                .ok_or(anyhow::anyhow!("not enough bytes to get the header length"))?,
+        )
+        .context("reading commit len bytes as string")?
+        .parse()
+        .context("parsing commit len bytes as a usize")?;
+        ensure!(bytes.len() - header_end_marker - 1 >= len);
+        let mut byte_cursor = header_end_marker + 1;
+        ensure!(
+            bytes[byte_cursor..].starts_with(TREE_HEADER_KEYWORD),
+            "missing tree header"
+        );
+        byte_cursor += TREE_HEADER_KEYWORD.len();
+        ensure!(
+            bytes[byte_cursor] == b' ',
+            "missing space after tree header"
+        );
+        byte_cursor += 1;
+        let tree_sha = sha1::hex_decode(
+            str::from_utf8(&bytes[byte_cursor..byte_cursor + 40])
+                .context("tree sha is not valid UTF-8")?,
+        )
+        .context("could not decode tree sha")?;
+        byte_cursor += 40;
+        ensure!(
+            bytes[byte_cursor] == b'\n',
+            "missing newline after tree sha"
+        );
+        byte_cursor += 1;
+        let mut parents = vec![];
+        while bytes[byte_cursor..].starts_with(PARENT_HEADER_KEYWORD) {
+            byte_cursor += PARENT_HEADER_KEYWORD.len();
+            ensure!(
+                bytes[byte_cursor] == b' ',
+                "missing space after parent header"
+            );
+            byte_cursor += 1;
+            let parent_sha = sha1::hex_decode(
+                str::from_utf8(&bytes[byte_cursor..byte_cursor + 40])
+                    .context("parent sha is not valid UTF-8")?,
+            )
+            .context("could not decode parent sha")?;
+            byte_cursor += 40;
+            parents.push(parent_sha);
+            ensure!(
+                bytes[byte_cursor] == b'\n',
+                "missing newline after parent sha"
+            );
+            byte_cursor += 1;
+        }
+
+        ensure!(
+            bytes[byte_cursor..].starts_with(AUTHOR_HEADER_KEYWORD),
+            "missing author header"
+        );
+        byte_cursor += AUTHOR_HEADER_KEYWORD.len();
+        ensure!(
+            bytes[byte_cursor] == b' ',
+            "missing space after author header"
+        );
+        byte_cursor += 1;
+        let author: AuthorshipInfo = bytes[byte_cursor..]
+            .try_into()
+            .context("could not parse author")?;
+        byte_cursor += bytes[byte_cursor..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or(anyhow::anyhow!("missing newline after author"))?;
+        byte_cursor += 1;
+
+        ensure!(
+            bytes[byte_cursor..].starts_with(COMMITTER_HEADER_KEYWORD),
+            "missing committer header"
+        );
+        byte_cursor += COMMITTER_HEADER_KEYWORD.len();
+        ensure!(
+            bytes[byte_cursor] == b' ',
+            "missing space after committer header"
+        );
+        byte_cursor += 1;
+        let committer: CommiterInfo = bytes[byte_cursor..]
+            .try_into()
+            .context("could not parse committer")?;
+        byte_cursor += bytes[byte_cursor..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or(anyhow::anyhow!("missing newline after committer"))?;
+
+        ensure!(
+            bytes[byte_cursor] == b'\n',
+            "missing newline after committer"
+        );
+        byte_cursor += 1;
+        ensure!(
+            bytes[byte_cursor] == b'\n',
+            "missing newline before message"
+        );
+        byte_cursor += 1;
+        let message = str::from_utf8(&bytes[byte_cursor..len + header_end_marker])
+            .context("message is not valid UTF-8")?;
+        //ensure!(bytes[len] == b'\n', "missing newline after message");
+        Ok(Self {
+            tree: tree_sha,
+            parents,
+            author,
+            committer,
+            message: message.to_string(),
+        })
     }
 }
 
@@ -547,11 +861,36 @@ impl Object {
         }
     }
 
-    fn from_path(path: &Path) -> anyhow::Result<Self> {
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         if path.is_dir() {
             Ok(Self::Tree(Tree::from_path(path)?))
         } else {
             Ok(Self::Blob(Blob::from_path(path)?))
+        }
+    }
+}
+
+impl Deserialize for Object {
+    fn deserialize(bytes: &[u8]) -> anyhow::Result<Self> {
+        if bytes.starts_with(BLOB_HEADER_KEYWORD) {
+            Blob::deserialize(bytes).map(Self::Blob)
+        } else if bytes.starts_with(TREE_HEADER_KEYWORD) {
+            Tree::deserialize(bytes).map(Self::Tree)
+        } else if bytes.starts_with(COMMIT_HEADER_KEYWORD) {
+            Commit::deserialize(bytes).map(Self::Commit)
+        } else {
+            bail!(
+            "wrong header (expected {}, {}, or {})",
+            str::from_utf8(BLOB_HEADER_KEYWORD).expect(
+                "check the definition of BLOB_HEADER_KEYWORD: should be a UTF8 encoded string"
+            ),
+            str::from_utf8(TREE_HEADER_KEYWORD).expect(
+                "check the definition of TREE_HEADER_KEYWORD: should be a UTF8 encoded string"
+            ),
+            str::from_utf8(COMMIT_HEADER_KEYWORD).expect(
+                "check the definition of COMMIT_HEADER_KEYWORD: should be a UTF8 encoded string"
+            )
+        );
         }
     }
 }

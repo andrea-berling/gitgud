@@ -58,7 +58,9 @@ fn process_block(block: [u8; 64], [mut a, mut b, mut c, mut d, mut e]: [u32; 5])
     [a, b, c, d, e]
 }
 
-pub type Digest = [u8; 20];
+pub const DIGEST_SIZE: usize = 20;
+
+pub type Digest = [u8; DIGEST_SIZE];
 
 #[allow(non_snake_case)]
 pub fn sha1(message: &[u8]) -> Digest {

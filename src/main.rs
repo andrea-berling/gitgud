@@ -10,10 +10,14 @@ use clap::{Parser, Subcommand};
 use git::FromSha1Hex;
 use git::HasPayload;
 use git::SerializeToGitObject;
+use pack_objects::PackedObjectsStream;
 use sha1::hex_encode;
 
 mod git;
+mod pack_objects;
+mod pkt_line;
 mod sha1;
+mod sideband;
 mod zlib;
 
 #[derive(Parser, Debug)]
@@ -75,6 +79,11 @@ enum Command {
         /// The file to inflate
         file: String,
     },
+    /// List the objects in a packfile
+    ListPack {
+        /// The pack file to list
+        file: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,14 +92,15 @@ fn main() -> anyhow::Result<()> {
     // Uncomment this block to pass the first stage
     let cli = Cli::parse();
 
-    let git_dir = PathBuf::from(".git");
+    let git_dir = PathBuf::from(git::GIT_DIRECTORY_NAME);
 
     match &cli.command {
         Command::Init => {
-            fs::create_dir(".git").unwrap();
-            fs::create_dir(".git/objects").unwrap();
-            fs::create_dir(".git/refs").unwrap();
-            fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
+            fs::create_dir(&git_dir).context("creating .git directory")?;
+            fs::create_dir(git_dir.join("objects")).context("creating objects directory")?;
+            fs::create_dir(git_dir.join("refs")).context("creating refs directory")?;
+            fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+                .context("writing to HEAD file")?;
             println!("Initialized git directory");
             Ok(())
         }
@@ -162,7 +172,7 @@ fn main() -> anyhow::Result<()> {
             parent,
             message,
         } => {
-            let commit_object = git::Commit::new(
+            let commit_object = git::Commit::new_no_author_no_committer(
                 sha1::hex_decode(tree_sha)
                     .context(format!("decoding {tree_sha} into a SHA1 digest"))?,
                 if let Some(parent) = parent {
@@ -178,6 +188,14 @@ fn main() -> anyhow::Result<()> {
                 .serialize(&git_dir)
                 .context(format!("serializing commit object {digest}",))?;
             println!("{digest}");
+            Ok(())
+        }
+        Command::ListPack { file } => {
+            let bytes = std::fs::read(file).context("reading pack file")?;
+            let mut object_stream: PackedObjectsStream = bytes[8..].try_into().context("parsing pack file")?;
+            for object in &mut object_stream {
+                println!("{object:#?}");
+            }
             Ok(())
         }
     }

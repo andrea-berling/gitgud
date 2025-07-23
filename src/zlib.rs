@@ -60,6 +60,7 @@ pub struct Stream {
     preset_dictionary: Option<[u8; 4]>,
     flags_check_bits: u8,
     compression_level: CompressionLevel,
+    size_compressed: Option<usize>,
     bytes: Vec<u8>,
 }
 
@@ -76,6 +77,7 @@ impl Stream {
             flags_check_bits: 0,
             compression_level,
             bytes,
+            size_compressed: None,
         }
     }
 
@@ -88,6 +90,7 @@ impl Stream {
         self.bytes.write_all(b"\x78\x01")?;
         self.bytes.append(&mut compressed_data);
         self.bytes.write_all(&checksum)?;
+        self.size_compressed = Some(compressed_data.len());
         Ok(&self.bytes)
     }
 
@@ -104,7 +107,27 @@ impl Stream {
             "invalid checksum after the compressed data"
         );
         self.bytes = result;
+        self.size_compressed = Some(parsed_bytes);
         Ok(&self.bytes)
+    }
+
+    /// Length of the stream in bytes after data has been compressed, including the header, preset
+    /// dictionary, and ADLER32 checksum
+    /// Returns None if the compressed size is not known yet. You can call deflate or inflate to
+    /// populate the field
+    pub fn serialization_len(&self) -> Option<usize> {
+        self.size_compressed.map(|x| {
+            x + 2
+                + 4
+                + match self.preset_dictionary {
+                    Some(..) => 4,
+                    None => 0,
+                }
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -128,8 +151,8 @@ impl TryFrom<&[u8]> for Stream {
     type Error = anyhow::Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        // At least enough bytes for CMF, FLG and the ADLER-32 checksum
-        ensure!(bytes.len() > 6, "not enough bytes");
+        // At least enough bytes for CMF
+        ensure!(bytes.len() > 2, "not enough bytes to parse CMF and FLG");
         // FCHECK validation
         ensure!(
             u16::from_be_bytes([bytes[0], bytes[1]]) % 31 == 0,
@@ -142,14 +165,16 @@ impl TryFrom<&[u8]> for Stream {
         let has_preset_dictionary = bytes[1] & (1 << 5) == 1 << 5;
         let compressed_data_offset = 2 + usize::from(has_preset_dictionary) * 4;
         let preset_dictionary = if has_preset_dictionary {
+            bail!("preset dictionaries are not supported");
             // We need 4 more bytes for DICTID
-            ensure!(bytes.len() > 10, "not enough bytes");
+            ensure!(bytes.len() > 6, "not enough bytes to parse DICTID");
             Some(bytes[2..2 + 4].try_into()?)
         } else {
             None
         };
         let compressed_data = bytes[compressed_data_offset..].to_vec();
         Ok(Self {
+            size_compressed: Some(compressed_data.len()),
             compression_method,
             preset_dictionary,
             flags_check_bits,
@@ -304,7 +329,9 @@ impl<'a> LSBBitsIterator<'a> {
     fn huffman_decode(&mut self, decompressor: &HuffmanDecompressor) -> anyhow::Result<u16> {
         let mut current_node_idx = 0;
         while !decompressor.is_leaf(current_node_idx) {
-            let next_bit = self.pop_bit().ok_or(anyhow::anyhow!("not enough bytes"))?;
+            let next_bit = self.pop_bit().ok_or(anyhow::anyhow!(
+                "not enough bytes to decode this huffman encoded symbol"
+            ))?;
             current_node_idx = decompressor
                 .next_node_idx(current_node_idx, next_bit)
                 .ok_or(anyhow::anyhow!("undexpected bit encountered"))?;
@@ -546,9 +573,9 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             result.write_all(&(!len).to_le_bytes())?;
             result.write_all(bytes)?;
         }
-        CompressionLevel::Low => todo!(),
-        CompressionLevel::Medium => todo!(),
-        CompressionLevel::Highest => todo!(),
+        CompressionLevel::Low => panic!("not implemented"),
+        CompressionLevel::Medium => panic!("not implemented"),
+        CompressionLevel::Highest => panic!("not implemented"),
     }
 
     Ok(result)
