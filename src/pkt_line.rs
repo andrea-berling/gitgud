@@ -1,7 +1,5 @@
 use anyhow::{Context, Ok};
 
-use crate::sha1;
-
 struct PktLines<'a> {
     bytes: &'a [u8],
     byte_cursor: usize,
@@ -77,7 +75,11 @@ mod tests {
     fn parse_pkt_line() {
         assert_eq!(
             Packet::Data(b"a\n"),
-            PktLines::new(b"0006a\n").into_iter().next().unwrap().unwrap()
+            PktLines::new(b"0006a\n")
+                .into_iter()
+                .next()
+                .unwrap()
+                .unwrap()
         );
         assert_eq!(
             Packet::Data(b"a"),

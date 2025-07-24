@@ -1,4 +1,10 @@
-use std::{fmt::Display, io::Write, iter::zip};
+use std::{
+    cmp::{min, Reverse},
+    collections::{BinaryHeap, HashMap},
+    fmt::Display,
+    io::Write,
+    iter::zip,
+};
 
 use anyhow::{bail, ensure, Context};
 
@@ -6,7 +12,7 @@ const COMPRESSION_LEVEL_MASK: u8 = 0x3;
 const BLOCK_TYPE_MASK: u8 = 0x3;
 const DEFLATE_IDENTIFIER: u8 = 0x8;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum CompressionLevel {
     Lowest,
     Low,
@@ -85,7 +91,7 @@ impl Stream {
         let checksum = adler32(&self.bytes);
         self.flags_check_bits = 1;
         let mut compressed_data = deflate(&self.bytes, self.compression_level)
-            .context("deflating the compressed data")?;
+            .context("deflating the uncompressed data")?;
         self.bytes.clear();
         self.bytes.write_all(b"\x78\x01")?;
         self.bytes.append(&mut compressed_data);
@@ -165,7 +171,7 @@ impl TryFrom<&[u8]> for Stream {
         let has_preset_dictionary = bytes[1] & (1 << 5) == 1 << 5;
         let compressed_data_offset = 2 + usize::from(has_preset_dictionary) * 4;
         let preset_dictionary = if has_preset_dictionary {
-            bail!("preset dictionaries are not supported");
+            bail!("preset dictionaries are not supported yet");
             // We need 4 more bytes for DICTID
             ensure!(bytes.len() > 6, "not enough bytes to parse DICTID");
             Some(bytes[2..2 + 4].try_into()?)
@@ -186,10 +192,10 @@ impl TryFrom<&[u8]> for Stream {
 
 #[derive(Clone, Copy)]
 enum BlockType {
-    NoCompression,
-    FixedHuffmanCodes,
-    DynamicHuffmanCodes,
-    Reserved,
+    NoCompression = 0b00,
+    FixedHuffmanCodes = 0b01,
+    DynamicHuffmanCodes = 0b10,
+    Reserved = 0b11,
 }
 
 const LITERALS_ALPHABET_SIZE: usize = 288;
@@ -342,6 +348,75 @@ impl<'a> LSBBitsIterator<'a> {
     }
 }
 
+struct LSBBitPacker {
+    buffer: Vec<u8>,
+    bits_written_so_far: usize,
+}
+
+impl LSBBitPacker {
+    fn new() -> Self {
+        Self {
+            buffer: vec![],
+            bits_written_so_far: 0,
+        }
+    }
+
+    fn push_bit(&mut self, bit: u8) {
+        if self.bits_written_so_far % 8 == 0 {
+            self.buffer.push(0);
+        }
+        self.buffer[self.bits_written_so_far / 8] |= (bit & 1) << (self.bits_written_so_far % 8);
+        self.bits_written_so_far += 1;
+    }
+
+    // Push `n` bits into the packer
+    fn push_bits(&mut self, mut bits: u64, mut n_bits: usize) {
+        while n_bits > 0 {
+            if self.bits_written_so_far % 8 == 0 {
+                self.buffer.push(0);
+            }
+            let byte_pos = self.bits_written_so_far / 8;
+            let shiftl = self.bits_written_so_far % 8;
+            let bits_we_can_write = min(8 - shiftl, n_bits) as u8;
+            let mask = (1 << bits_we_can_write) - 1;
+
+            self.buffer[byte_pos] |= (bits as u8 & mask) << shiftl;
+            self.bits_written_so_far += bits_we_can_write as usize;
+            n_bits -= bits_we_can_write as usize;
+            bits >>= bits_we_can_write;
+        }
+    }
+
+    #[inline]
+    fn push_reversed_bits(&mut self, bits: u64, n_bits: usize) {
+        self.push_bits(bits.reverse_bits() >> (u64::BITS as usize - n_bits), n_bits);
+    }
+
+    fn bit_cursor(&self) -> usize {
+        self.bits_written_so_far
+    }
+
+    fn align_to_next_byte_if_unaligned(&mut self) {
+        if self.bits_written_so_far % 8 == 0 {
+            self.bits_written_so_far = (self.bits_written_so_far + 8) / 8;
+        }
+    }
+
+    fn push_byte_aligned_u16_le(&mut self, val: u16) -> bool {
+        if self.bits_written_so_far % 8 != 0 {
+            return false;
+        }
+
+        self.align_to_next_byte_if_unaligned();
+        self.buffer.extend(val.to_le_bytes());
+        true
+    }
+
+    fn to_vec(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct HuffmanNode {
     left: Option<u16>,
@@ -350,6 +425,7 @@ struct HuffmanNode {
 }
 
 impl HuffmanNode {
+    #[inline]
     fn is_leaf(&self) -> bool {
         self.payload.is_some()
     }
@@ -431,13 +507,18 @@ impl HuffmanDecompressor {
     }
 }
 
+const CODE_LENGTHS_SYMBOL_MAP: [u16; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+const CODE_LENGTHS_INVERSE_SYMBOL_MAP: [u16; 19] = [
+    3, 17, 15, 13, 11, 9, 7, 5, 4, 6, 8, 10, 12, 14, 16, 18, 0, 1, 2,
+];
+
 fn get_code_lengths_decoder(
     lsb_iterator: &mut LSBBitsIterator<'_>,
     n_lengths: usize,
 ) -> anyhow::Result<HuffmanDecompressor> {
-    const CODE_LENGTHS_SYMBOL_MAP: [u16; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
     let mut code_lengths_codes_lengths = vec![0; CODE_LENGTHS_SYMBOL_MAP.len()];
     // There are n_lengths in the input each represented as 3 bits in LSB order. The remaining 19 -
     // n_lengths are 0
@@ -560,7 +641,105 @@ fn get_decoders_from_encoded_lengths(
     ))
 }
 
+fn huffman_codes_lengths_from_huffman_tree(
+    tree: &[HuffmanNode],
+    root_idx: u16,
+    depth: usize,
+) -> anyhow::Result<Vec<(usize, u16)>> {
+    ensure!(root_idx < tree.len() as u16);
+    let current_node = &tree[root_idx as usize];
+    if current_node.is_leaf() {
+        Ok(vec![(depth, current_node.payload.unwrap())])
+    } else {
+        let mut left = if let Some(child) = current_node.left {
+            huffman_codes_lengths_from_huffman_tree(tree, child, depth + 1)
+                .context("computing huffman code length for left child")?
+        } else {
+            vec![]
+        };
+        let mut right = if let Some(child) = current_node.right {
+            huffman_codes_lengths_from_huffman_tree(tree, child, depth + 1)
+                .context("computing huffman code length for right child")?
+        } else {
+            vec![]
+        };
+        left.append(&mut right);
+        Ok(left)
+    }
+}
+
+// TODO: write tests
+/// Returns the lengths and the symbol map
+fn huffman_codes_lengths_from_symbols(bytes: &[u16]) -> anyhow::Result<(Vec<usize>, Vec<u16>)> {
+    let mut frequencies = HashMap::new();
+    for symbol in bytes {
+        *frequencies.entry(*symbol).or_insert(0) += 1;
+    }
+    if frequencies.keys().len() == 1 {
+        bail!("single symbol string not supported yet")
+    }
+    let mut huffman_tree: Vec<_> = frequencies
+        .keys()
+        .map(|&key| HuffmanNode {
+            left: None,
+            right: None,
+            payload: Some(key),
+        })
+        .collect();
+    let mut priority_queue = BinaryHeap::new();
+    for (i, node) in huffman_tree.iter().enumerate() {
+        priority_queue.push(Reverse((frequencies[&node.payload.unwrap()], i)));
+    }
+    let mut root_idx = 0;
+    while priority_queue.len() > 1 {
+        let Reverse(least_frequent) = priority_queue.pop().unwrap();
+        let Reverse(second_least_frequent) = priority_queue.pop().unwrap();
+        let root = HuffmanNode {
+            left: Some(second_least_frequent.1 as u16),
+            right: Some(least_frequent.1 as u16),
+            payload: None,
+        };
+        huffman_tree.push(root);
+        root_idx = huffman_tree.len() as u16 - 1;
+        priority_queue.push(Reverse((
+            least_frequent.0 + second_least_frequent.0,
+            huffman_tree.len() - 1,
+        )));
+    }
+    let mut huffman_code_lengths =
+        huffman_codes_lengths_from_huffman_tree(&huffman_tree, root_idx, 0)
+            .context("computing huffman codes lengths")?;
+    // Canonical Huffman tree expect lexicographic order in the codes assigned to symbols
+    huffman_code_lengths.sort_by(|(_, code1), (_, code2)| code1.cmp(code2));
+
+    Ok(huffman_code_lengths.into_iter().unzip())
+}
+
+struct HuffmanCompressor {
+    encoder: Vec<(u16, usize)>,
+}
+
+impl HuffmanCompressor {
+    fn new(code_lengths: &[usize], symbol_map: &[u16]) -> Self {
+        // TODO: put a better number than 300 here
+        let mut encoder = vec![(0, 0); 300];
+        for (i, &code) in huffman_codes(code_lengths).iter().enumerate() {
+            encoder[symbol_map[i] as usize] = (code, code_lengths[i])
+        }
+        Self { encoder }
+    }
+
+    #[inline]
+    fn encode(&self, symbol: u16) -> anyhow::Result<(u16, usize)> {
+        ensure!(symbol < self.encoder.len().try_into().context("TODO")?);
+        Ok(self.encoder[symbol as usize])
+    }
+}
+
 fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
+    if bytes.is_empty() {
+        bail!("empty stream of bytes not supported yet")
+    }
     let mut result = vec![];
     // TODO: a system to cleverly divide the input into blocks, select the appropriate compression
     // method for each block, and use that
@@ -573,12 +752,197 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             result.write_all(&(!len).to_le_bytes())?;
             result.write_all(bytes)?;
         }
-        CompressionLevel::Low => panic!("not implemented"),
+        CompressionLevel::Low => {
+            // RFC 1951 Section 3.2.7
+            // dynamic huffman encoding without LZ88
+            let mut symbols: Vec<_> = bytes.iter().map(|&symbol| symbol as u16).collect();
+            // We only have one block, and thus one end of data
+            // marker
+            symbols.push(256);
+            let (main_huffman_code_lengths, main_huffman_symbol_map) =
+                huffman_codes_lengths_from_symbols(&symbols)
+                    .context("computing huffman code lengths for the bytes")?;
+            let mut hlit_array = vec![0; 257];
+            for i in 0..main_huffman_symbol_map.len() {
+                hlit_array[main_huffman_symbol_map[i] as usize] = main_huffman_code_lengths[i];
+            }
+            let hlit = hlit_array.len() - 257;
+            // No distance codes used
+            let compact_distance_codes = [EncodedLength::Literal(0)];
+            let hdist = 0;
+            let (
+                compact_code_lengths,
+                (code_lengths_encoding_code_lengths, code_lengths_symbol_map),
+            ) = code_lengths_encoding_code_lengths(&hlit_array)
+                .context("computing the length of codes used to encode code lengths")?;
+            let mut hclen_array = vec![0; CODE_LENGTHS_SYMBOL_MAP.len()];
+            for i in 0..code_lengths_symbol_map.len() {
+                hclen_array[CODE_LENGTHS_INVERSE_SYMBOL_MAP[code_lengths_symbol_map[i] as usize]
+                    as usize] = code_lengths_encoding_code_lengths[i];
+            }
+
+            let hclen_array_end = hclen_array
+                .iter()
+                .rposition(|&x| x != 0)
+                .ok_or(anyhow::anyhow!("TODO"))?
+                + 1;
+            hclen_array.truncate(hclen_array_end);
+
+            let hclen = hclen_array.len() - 4;
+
+            let code_lengths_compressor = HuffmanCompressor::new(
+                &code_lengths_encoding_code_lengths,
+                &code_lengths_symbol_map,
+            );
+
+            let main_compressor =
+                HuffmanCompressor::new(&main_huffman_code_lengths, &main_huffman_symbol_map);
+
+            let mut bit_packer = LSBBitPacker::new();
+            bit_packer.push_bits(
+                (((BlockType::DynamicHuffmanCodes as u8) << 1) | 1) as u64,
+                3,
+            );
+            bit_packer.push_bits(hlit as u64, 5);
+            bit_packer.push_bits(hdist as u64, 5);
+            bit_packer.push_bits(hclen as u64, 4);
+            for &len in &hclen_array {
+                bit_packer.push_bits(len as u64, 3);
+            }
+            for &encoded_code_len in &compact_code_lengths {
+                encoded_code_len
+                    .compress(&mut bit_packer, &code_lengths_compressor)
+                    .context("TODO")?
+            }
+            for encoded_code_len in &compact_distance_codes {
+                encoded_code_len
+                    .compress(&mut bit_packer, &code_lengths_compressor)
+                    .context("TODO")?
+            }
+            for &byte in bytes {
+                let (code, code_len) = main_compressor.encode(byte as u16).context("TODO")?;
+                bit_packer.push_reversed_bits(code as u64, code_len);
+            }
+
+            let (end_block_code, end_block_code_len) =
+                main_compressor.encode(256).context("TODO")?;
+            bit_packer.push_bits(end_block_code as u64, end_block_code_len);
+            result = bit_packer.to_vec();
+        }
         CompressionLevel::Medium => panic!("not implemented"),
         CompressionLevel::Highest => panic!("not implemented"),
     }
 
     Ok(result)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodedLength {
+    Literal(u8),
+    RepeatPrevious(u8),
+    RepeatShortSequenceOfZeros(u8),
+    RepeatLongSequenceOfZeros(u8),
+}
+
+impl EncodedLength {
+    fn to_code(self) -> u8 {
+        match self {
+            EncodedLength::Literal(n) => n,
+            EncodedLength::RepeatPrevious(_) => 16,
+            EncodedLength::RepeatShortSequenceOfZeros(_) => 17,
+            EncodedLength::RepeatLongSequenceOfZeros(_) => 18,
+        }
+    }
+
+    fn compress(
+        self,
+        bit_packer: &mut LSBBitPacker,
+        compressor: &HuffmanCompressor,
+    ) -> anyhow::Result<()> {
+        match self {
+            EncodedLength::Literal(n) => {
+                let (code, code_len) = compressor.encode(n as u16).context("TODO")?;
+                bit_packer.push_reversed_bits(code as u64, code_len);
+            }
+            EncodedLength::RepeatPrevious(count) => {
+                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                bit_packer.push_reversed_bits(code as u64, code_len);
+                bit_packer.push_bits(count as u64, 2);
+            }
+            EncodedLength::RepeatShortSequenceOfZeros(count) => {
+                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                bit_packer.push_reversed_bits(code as u64, code_len);
+                bit_packer.push_bits(count as u64 - 3, 3);
+            }
+            EncodedLength::RepeatLongSequenceOfZeros(count) => {
+                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                bit_packer.push_reversed_bits(code as u64, code_len);
+                bit_packer.push_bits(count as u64 - 11, 7);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn code_lengths_encoding_code_lengths(
+    hlit_array: &[usize],
+) -> anyhow::Result<(Vec<EncodedLength>, (Vec<usize>, Vec<u16>))> {
+    if hlit_array.len() == 1 {
+        bail!("hlit array with single element not supported yet");
+    }
+    let mut compact_huffman_code_lengths_pass_1 = vec![];
+    for &code_length in hlit_array {
+        compact_huffman_code_lengths_pass_1.push(EncodedLength::Literal(
+            code_length.try_into().context("code length does not fit in u8")?,
+        ));
+    }
+    let mut compact_huffman_code_lengths = vec![];
+    for encoded_length_run in compact_huffman_code_lengths_pass_1.chunk_by(|a, b| a == b) {
+        let run_length: u8 = encoded_length_run
+            .len()
+            .try_into()
+            .context("run length does not fit in u8")?;
+        let EncodedLength::Literal(lit) = encoded_length_run[0] else {
+            unreachable!()
+        };
+        if lit != 0 {
+            if encoded_length_run.len() >= 3 {
+                compact_huffman_code_lengths.extend([
+                    encoded_length_run[0],
+                    EncodedLength::RepeatPrevious(run_length - 1),
+                ]);
+            } else {
+                compact_huffman_code_lengths.extend(encoded_length_run);
+            }
+        } else if encoded_length_run.len() >= 3 {
+            if encoded_length_run.len() >= 11 {
+                compact_huffman_code_lengths
+                    .push(EncodedLength::RepeatLongSequenceOfZeros(run_length));
+            } else {
+                compact_huffman_code_lengths
+                    .push(EncodedLength::RepeatShortSequenceOfZeros(run_length));
+            }
+        } else {
+            compact_huffman_code_lengths.extend(encoded_length_run);
+        }
+    }
+
+    let used_lengths: Vec<_> = compact_huffman_code_lengths
+        .iter()
+        .map(|code_length| code_length.to_code() as u16)
+        .collect();
+    let (huffman_code_lengths, symbol_map) = huffman_codes_lengths_from_symbols(&used_lengths)
+        .context("computing huffman codes for used lengths")?;
+
+    // Canonical Huffman tree expect lexicographic order in the codes assigned to symbols
+    let mut huffman_lengths_and_map: Vec<_> = zip(huffman_code_lengths, symbol_map)
+        .filter(|(len, _)| *len != 0)
+        .collect();
+    huffman_lengths_and_map.sort_by_key(|x| x.1);
+    Ok((
+        compact_huffman_code_lengths,
+        huffman_lengths_and_map.into_iter().unzip(),
+    ))
 }
 
 fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
@@ -600,7 +964,7 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
         match block_type {
             BlockType::NoCompression => {
                 if !lsb_iterator.align_to_next_byte_if_unaligned() {
-                    bail!("stream ended too early")
+                    bail!("stream ended too early: couldn't read neither LEN nor NLEN")
                 }
                 let Some(len) = lsb_iterator.pop_byte_aligned_u16() else {
                     bail!("stream ended too early: couldn't read LEN")
@@ -610,7 +974,7 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                 };
                 ensure!(
                     !len == nlen,
-                    "inconsistent values for LEN and NLEN before at {}: {:#x?}",
+                    "inconsistent values for LEN ({len:#x}) and NLEN ({nlen:#x}) at {}: {:#x?}",
                     lsb_iterator.bit_cursor() - 32,
                     bytes
                 );
@@ -1082,5 +1446,27 @@ mod tests {
         stream.inflate().unwrap();
         stream = COMPRESSED_GIT_COMMIT_DYNAMIC.try_into().unwrap();
         stream.inflate().unwrap();
+    }
+
+    #[test]
+    fn test_round_trip() {
+        let value_to_compress = b"hello world";
+        for level in [CompressionLevel::Lowest, CompressionLevel::Low] {
+            let mut stream: Stream = Stream::new(
+                CompressionMethod::DEFLATE(2 << 7),
+                None,
+                level,
+                value_to_compress.to_vec(),
+            )
+            .deflate()
+            .unwrap()
+            .try_into()
+            .unwrap();
+            assert_eq!(
+                value_to_compress,
+                &stream.inflate().unwrap(),
+                "round trip failed for compression level {level:?}"
+            );
+        }
     }
 }

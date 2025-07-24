@@ -79,9 +79,21 @@ enum Command {
         /// The file to inflate
         file: String,
     },
+    /// Deflate a file into a zlib stream
+    ZlibDeflate {
+        /// The file to deflate
+        file: String,
+        #[arg(short = 'l')]
+        level: Option<zlib::CompressionLevel>,
+    },
     /// List the objects in a packfile
     ListPack {
         /// The pack file to list
+        file: String,
+    },
+    /// Unpack objects from a packfile
+    UnpackObjects {
+        /// The pack file to unpack
         file: String,
     },
 }
@@ -162,7 +174,7 @@ fn main() -> anyhow::Result<()> {
             let cwd = &PathBuf::from(".");
             let tree = git::Tree::from_path(cwd)
                 .context("making a tree object from the current directory")?;
-            tree.serialize(cwd, &git_dir)
+            tree.serialize_recursively(cwd, &git_dir)
                 .context("serializing tree for current directory")?;
             println!("{}", sha1::hex_encode(&tree.digest()));
             Ok(())
@@ -192,10 +204,61 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ListPack { file } => {
             let bytes = std::fs::read(file).context("reading pack file")?;
-            let mut object_stream: PackedObjectsStream = bytes[8..].try_into().context("parsing pack file")?;
+            let mut object_stream: PackedObjectsStream =
+                bytes[8..].try_into().context("parsing pack file")?;
             for object in &mut object_stream {
-                println!("{object:#?}");
+                println!("{:#?}", object.context("checking the unpacked object")?);
             }
+            Ok(())
+        }
+        Command::UnpackObjects { file } => {
+            let bytes = std::fs::read(file).context("reading pack file")?;
+            let mut object_stream: PackedObjectsStream =
+                bytes[8..].try_into().context("parsing pack file")?;
+            let mut unresolved = vec![];
+            for object in &mut object_stream {
+                match object.context("failed to unpack object")? {
+                    pack_objects::PackedObject::Object(object) => {
+                        object
+                            .serialize(None, &git_dir)
+                            .context("failed to serialize object")?;
+                    }
+                    pack_objects::PackedObject::RefDelta(ref_delta) => {
+                        let ref_delta_clone = ref_delta.clone();
+                        if !pack_objects::PackedObject::from(ref_delta)
+                            .serialize(&git_dir)
+                            .context("failed to serialize ref delta object")?
+                        {
+                            // This is a temporary workaround for efficiency, will be revisited later
+                            unresolved.push(ref_delta_clone);
+                            continue;
+                        }
+                    }
+                }
+            }
+            while let Some(ref_delta) = unresolved.pop() {
+                let ref_delta_clone = ref_delta.clone();
+                if !pack_objects::PackedObject::from(ref_delta)
+                    .serialize(&git_dir)
+                    .context("failed to serialize unresolved ref delta object")?
+                {
+                    // This is a temporary workaround for efficiency, will be revisited later
+                    unresolved.push(ref_delta_clone);
+                    continue;
+                }
+            }
+            Ok(())
+        }
+        Command::ZlibDeflate { file, level } => {
+            let mut stream = zlib::Stream::new(
+                zlib::CompressionMethod::DEFLATE(2 << 7),
+                None,
+                level.unwrap_or(zlib::CompressionLevel::Lowest),
+                std::fs::read(file).context(format!("reading file {}", file))?,
+            );
+            stdout()
+                .write_all(stream.deflate().context("deflating stream")?)?;
+            stdout().flush().context("flushing stdout")?;
             Ok(())
         }
     }

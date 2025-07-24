@@ -2,12 +2,13 @@ use std::{
     cmp::min,
     fmt::Debug,
     ops::{Deref, DerefMut},
+    path::Path,
 };
 
 use anyhow::{bail, ensure, Context};
 
 use crate::{
-    git::{self, Deserialize},
+    git::{self, Deserialize, FromSha1Hex, HasPayload},
     sha1::{self, hex_encode},
     zlib,
 };
@@ -134,6 +135,10 @@ impl<'a> TryFrom<&'a [u8]> for PackedObjectsStream<'a> {
         )
         .try_into()
         .context("parsing pack version")?;
+        ensure!(
+            matches!(version, PackVersion::V2),
+            "we only support pack version 2"
+        );
         let n_objects = u32::from_be_bytes(
             bytes
                 .pop_bytes(4)
@@ -153,6 +158,64 @@ impl<'a> TryFrom<&'a [u8]> for PackedObjectsStream<'a> {
 pub enum PackedObject {
     Object(git::Object),
     RefDelta(RefDelta),
+}
+
+impl From<RefDelta> for PackedObject {
+    fn from(v: RefDelta) -> Self {
+        Self::RefDelta(v)
+    }
+}
+
+impl PackedObject {
+    pub fn serialize(&self, git_dir_path: &Path) -> anyhow::Result<bool> {
+        match self {
+            PackedObject::Object(object) => object.serialize(None, git_dir_path).map(|_| true),
+            PackedObject::RefDelta(ref_delta) => {
+                let base_path = git::object_path(git_dir_path, &ref_delta.base)
+                    .context("getting object path for base object")?;
+                if !base_path.exists() {
+                    return Ok(false);
+                }
+                let base_object =
+                    git::Object::from_sha1_hex(&hex_encode(&ref_delta.base), git_dir_path)
+                        .context("fetching base object from sha1 hex")?;
+                ensure!(
+                    base_object.size() == ref_delta.src_header_size(),
+                    "base object size doesn't match stored source header size ({} vs {})",
+                    base_object.size(),
+                    ref_delta.src_header_size()
+                );
+                let base_object_bytes = base_object.payload();
+                let header_end_marker =
+                    base_object_bytes
+                        .iter()
+                        .position(|&b| b == 0x00)
+                        .ok_or(anyhow::anyhow!(
+                            "base object is malformed (no null byte to mark the end of the header)"
+                        ))?;
+                let mut new_object_bytes = Vec::from(base_object.header_keyword());
+                new_object_bytes.push(b' ');
+                new_object_bytes.extend(ref_delta.dst_header_size().to_string().bytes());
+                new_object_bytes.push(0x00);
+                new_object_bytes.extend(
+                    ref_delta
+                        .resolve(&base_object_bytes[header_end_marker + 1..])
+                        .context("failed to resolve ref delta")?,
+                );
+                println!("{:?}", str::from_utf8(&new_object_bytes));
+                let object = git::Object::deserialize(&new_object_bytes)
+                    .context("failed to deserialize object")?;
+                ensure!(
+                    object.size() == ref_delta.dst_header_size(),
+                    "newly created object size doesn't match what the ref delta expects"
+                );
+                object
+                    .serialize(None, git_dir_path)
+                    .context("failed to serialize object")?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for &mut PackedObjectsStream<'a> {
@@ -233,7 +296,8 @@ impl<'a> Iterator for &mut PackedObjectsStream<'a> {
 
 const DELTA_SIZE_MIN: usize = 4;
 
-enum PatchCommand {
+#[derive(Clone)]
+pub enum PatchCommand {
     Copy { offset: usize, size: usize },
     Add(Vec<u8>),
 }
@@ -274,19 +338,29 @@ impl Debug for PatchCommand {
 }
 
 impl PatchCommand {
-    fn parse_from_bytes(bytes: &mut BytesBuffer<'_>) -> Option<Self> {
-        let cmd = bytes.pop_byte()?;
+    fn parse_from_bytes(bytes: &mut BytesBuffer<'_>) -> anyhow::Result<Self> {
+        let cmd = bytes
+            .pop_byte()
+            .ok_or(anyhow::anyhow!("not enough bytes to parse a patch command"))?;
         if cmd & 0x80 == 0x80 {
-            Some(parse_copy_command(bytes, cmd)?)
+            parse_copy_command(bytes, cmd).context("parsing copy command")
         } else if cmd > 0 {
-            Some(Self::Add(bytes.pop_bytes(cmd as usize)?.to_vec()))
+            Ok(Self::Add(
+                bytes
+                    .pop_bytes(cmd as usize)
+                    .ok_or(anyhow::anyhow!(
+                        "not enough bytes to pop for the add command"
+                    ))?
+                    .to_vec(),
+            ))
         } else {
             panic!("reserved patch command 0 encountered");
         }
     }
 }
 
-struct RefDelta {
+#[derive(Clone)]
+pub struct RefDelta {
     base: sha1::Digest,
     src_header_size: usize,
     dst_header_size: usize,
@@ -324,17 +398,23 @@ fn parse_delta_header_size(bytes: &mut BytesBuffer, size_bytes: usize) -> Option
 }
 
 /// Returns offset and size
-fn parse_copy_command(bytes: &mut BytesBuffer, cmd: u8) -> Option<PatchCommand> {
+fn parse_copy_command(bytes: &mut BytesBuffer, cmd: u8) -> anyhow::Result<PatchCommand> {
     let mut offset = 0usize;
     for shift in 0..4 {
-        if cmd & (1 << shift) == (1 << shift) {
-            offset |= (bytes.pop_byte()? as usize) << (shift * 8)
+        if (cmd >> shift) & 1 == 1 {
+            offset |= (bytes.pop_byte().ok_or(anyhow::anyhow!(
+                "not enough bytes to add to the copy command offset"
+            ))? as usize)
+                << (shift * 8)
         }
     }
-    let mut size = 0;
+    let mut size = 0usize;
     for shift in 0..3 {
         if (cmd >> (4 + shift)) & 1 == 1 {
-            size |= (bytes.pop_byte()? as usize) << (shift * 8)
+            size |= (bytes.pop_byte().ok_or(anyhow::anyhow!(
+                "not enough bytes to add to the copy command size"
+            ))? as usize)
+                << (shift * 8)
         }
     }
 
@@ -343,7 +423,7 @@ fn parse_copy_command(bytes: &mut BytesBuffer, cmd: u8) -> Option<PatchCommand> 
     }
 
     // TODO: check on the lengths and offset
-    Some(PatchCommand::Copy { offset, size })
+    Ok(PatchCommand::Copy { offset, size })
 }
 
 impl RefDelta {
@@ -377,22 +457,28 @@ impl RefDelta {
                     .ok_or_else(|| anyhow::anyhow!("could not get serialization length"))?,
             )
             .ok_or_else(|| anyhow::anyhow!("not enough bytes to pop serialized stream"))?;
+        ensure!(
+            stream.bytes().len() == size_bytes,
+            "number of inflated bytes and expected delta size don't match ({} vs {size_bytes})",
+            stream.bytes().len()
+        );
         let mut delta_bytes = BytesBuffer::new(stream.bytes());
 
+        let mut prev_byte_cursor = delta_bytes.byte_cursor();
         let src_header_size = parse_delta_header_size(&mut delta_bytes, size_bytes)
             .ok_or_else(|| anyhow::anyhow!("could not parse src header size"))?;
         let dst_header_size = parse_delta_header_size(&mut delta_bytes, size_bytes)
             .ok_or_else(|| anyhow::anyhow!("could not parse dst header size"))?;
 
+        size_bytes -= delta_bytes.byte_cursor() - prev_byte_cursor;
+        prev_byte_cursor = delta_bytes.byte_cursor();
         let mut commands = vec![];
-        let mut byte_cursor = delta_bytes.byte_cursor();
         while size_bytes > 0 {
-            let Some(cmd) = PatchCommand::parse_from_bytes(&mut delta_bytes) else {
-                break;
-            };
+            let cmd = PatchCommand::parse_from_bytes(&mut delta_bytes)
+                .context("parsing a patch command")?;
             commands.push(cmd);
-            size_bytes -= delta_bytes.byte_cursor() - byte_cursor;
-            byte_cursor = delta_bytes.byte_cursor();
+            size_bytes -= delta_bytes.byte_cursor() - prev_byte_cursor;
+            prev_byte_cursor = delta_bytes.byte_cursor();
         }
         Ok(Self {
             base,
@@ -400,6 +486,43 @@ impl RefDelta {
             dst_header_size,
             commands,
         })
+    }
+
+    pub fn base(&self) -> [u8; sha1::DIGEST_SIZE] {
+        self.base
+    }
+
+    pub fn src_header_size(&self) -> usize {
+        self.src_header_size
+    }
+
+    pub fn dst_header_size(&self) -> usize {
+        self.dst_header_size
+    }
+
+    pub fn commands(&self) -> &[PatchCommand] {
+        &self.commands
+    }
+
+    pub fn resolve(&self, base_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut object_bytes = vec![];
+        for command in &self.commands {
+            match command {
+                &PatchCommand::Copy { offset, size } => {
+                    object_bytes.extend_from_slice(
+                        base_bytes.get(offset..offset + size).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid copy command, not enough bytes in base object to copy from"
+                            )
+                        })?,
+                    );
+                }
+                PatchCommand::Add(bytes) => {
+                    object_bytes.extend_from_slice(bytes);
+                }
+            }
+        }
+        Ok(object_bytes)
     }
 }
 

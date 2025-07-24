@@ -13,6 +13,7 @@ pub const TREE_HEADER_KEYWORD: &[u8] = b"tree";
 pub const COMMIT_HEADER_KEYWORD: &[u8] = b"commit";
 pub const PARENT_HEADER_KEYWORD: &[u8] = b"parent";
 pub const AUTHOR_HEADER_KEYWORD: &[u8] = b"author";
+pub const GPG_SIGNATURE_HEADER_KEYWORD: &[u8] = b"gpgsig";
 pub const COMMITTER_HEADER_KEYWORD: &[u8] = b"committer";
 
 use anyhow::{bail, ensure, Context};
@@ -192,6 +193,10 @@ impl Blob {
         Ok(Self {
             bytes: fs::read(path).context(format!("reading from {:?}", path.to_str()))?,
         })
+    }
+
+    fn size(&self) -> usize {
+        self.bytes.len()
     }
 }
 
@@ -380,7 +385,11 @@ impl Tree {
         sha1::sha1(&self.payload())
     }
 
-    pub fn serialize(&self, self_path: &Path, git_dir_path: &Path) -> Result<(), anyhow::Error> {
+    pub fn serialize_recursively(
+        &self,
+        self_path: &Path,
+        git_dir_path: &Path,
+    ) -> Result<(), anyhow::Error> {
         // Serialize all the entries first
         for entry in &self.entries {
             let object_path = self_path.join(&entry.name);
@@ -389,7 +398,7 @@ impl Tree {
                     "making an object out of {:?}",
                     object_path.to_str()
                 ))?
-                .serialize(&object_path, git_dir_path)
+                .serialize(Some(&object_path), git_dir_path)
                 .context(format!("serializing {}", hex_encode(&entry.sha1)))?;
         }
         write_object(&self.payload(), git_dir_path)
@@ -429,6 +438,13 @@ impl Tree {
             }
         }
         Ok(tree)
+    }
+
+    fn size(&self) -> usize {
+        self.entries()
+            .iter()
+            .map(|entry| entry.serialization_len())
+            .sum()
     }
 }
 
@@ -610,6 +626,7 @@ pub struct Commit {
     parents: Vec<sha1::Digest>,
     author: AuthorshipInfo,
     committer: CommiterInfo,
+    gpg_signature: Option<String>,
     message: String,
 }
 
@@ -658,8 +675,41 @@ impl Commit {
                     .as_secs(),
                 timezone: 0,
             },
+            gpg_signature: None,
             message,
         }
+    }
+
+    fn size(&self) -> usize {
+        let mut size = 0;
+        size += TREE_HEADER_KEYWORD.len();
+        size += 1; // space
+        size += 40; // sha1 hex
+        size += 1; // newline
+        for _ in &self.parents {
+            size += PARENT_HEADER_KEYWORD.len();
+            size += 1; // space
+            size += 40; // sha1 hex
+            size += 1; // newline
+        }
+        size += AUTHOR_HEADER_KEYWORD.len();
+        size += 1; // space
+        size += <Vec<u8>>::from(&self.author).len();
+        size += 1; // newline
+        size += COMMITTER_HEADER_KEYWORD.len();
+        size += 1; // space
+        size += <Vec<u8>>::from(&self.committer).len();
+        size += 1; // newline
+        if let Some(signature) = &self.gpg_signature {
+            size += GPG_SIGNATURE_HEADER_KEYWORD.len();
+            size += 1; // space
+            size += signature.len();
+            size += 1; // newline
+        }
+        size += 1; // newline
+        size += self.message.len();
+        size += 1; // newline
+        size
     }
 }
 
@@ -693,6 +743,12 @@ impl HasPayload for Commit {
         payload.push(b' ');
         payload.extend(&<Vec<u8>>::from(&self.committer));
         payload.push(b'\n');
+        if let Some(signature) = &self.gpg_signature {
+            payload.extend(GPG_SIGNATURE_HEADER_KEYWORD);
+            payload.push(b' ');
+            payload.extend(signature.bytes());
+            payload.push(b'\n');
+        }
         payload.push(b'\n');
         payload.extend(self.message.bytes());
         payload.push(b'\n');
@@ -819,6 +875,29 @@ impl Deserialize for Commit {
             "missing newline after committer"
         );
         byte_cursor += 1;
+
+        let mut gpg_signature = None;
+        if bytes[byte_cursor..].starts_with(GPG_SIGNATURE_HEADER_KEYWORD) {
+            byte_cursor += GPG_SIGNATURE_HEADER_KEYWORD.len();
+            ensure!(
+                bytes[byte_cursor] == b' ',
+                "missing space after parent header"
+            );
+            byte_cursor += 1;
+            let mut end_marker = byte_cursor + 1;
+            while bytes
+                .get(end_marker..end_marker + 2)
+                .ok_or(anyhow::anyhow!("not enough bytes to parse gpg signature"))?
+                != b"\n\n"
+            {
+                end_marker += 1;
+            }
+            gpg_signature = Some(
+                String::from_utf8(bytes[byte_cursor..end_marker].to_vec())
+                    .context("gpg signature is not valid UTF-8")?,
+            );
+            byte_cursor = end_marker + 1;
+        }
         ensure!(
             bytes[byte_cursor] == b'\n',
             "missing newline before message"
@@ -832,6 +911,7 @@ impl Deserialize for Commit {
             parents,
             author,
             committer,
+            gpg_signature,
             message: message.to_string(),
         })
     }
@@ -853,10 +933,20 @@ impl Object {
         }
     }
 
-    fn serialize(&self, object_path: &Path, git_dir_path: &Path) -> anyhow::Result<()> {
+    pub fn serialize(&self, object_path: Option<&Path>, git_dir_path: &Path) -> anyhow::Result<()> {
         match self {
-            Object::Blob(blob) => blob.serialize(git_dir_path),
-            Object::Tree(tree) => tree.serialize(object_path, git_dir_path),
+            Object::Blob(blob) => blob
+                .serialize(git_dir_path)
+                .context("failed to serialize blob"),
+            Object::Tree(tree) => {
+                if let Some(object_path) = object_path {
+                    tree.serialize_recursively(object_path, git_dir_path)
+                        .context("failed to serialize tree recursively")
+                } else {
+                    tree.serialize(git_dir_path)
+                        .context("failed to serialize tree")
+                }
+            }
             Object::Commit(commit) => commit.serialize(git_dir_path),
         }
     }
@@ -868,16 +958,38 @@ impl Object {
             Ok(Self::Blob(Blob::from_path(path)?))
         }
     }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Object::Blob(blob) => blob.size(),
+            Object::Tree(tree) => tree.size(),
+            Object::Commit(commit) => commit.size(),
+        }
+    }
+
+    pub fn header_keyword(&self) -> &'static [u8] {
+        match self {
+            Object::Blob(_) => BLOB_HEADER_KEYWORD,
+            Object::Tree(_) => TREE_HEADER_KEYWORD,
+            Object::Commit(_) => COMMIT_HEADER_KEYWORD,
+        }
+    }
 }
 
 impl Deserialize for Object {
     fn deserialize(bytes: &[u8]) -> anyhow::Result<Self> {
         if bytes.starts_with(BLOB_HEADER_KEYWORD) {
-            Blob::deserialize(bytes).map(Self::Blob)
+            Blob::deserialize(bytes)
+                .map(Self::Blob)
+                .context("deserializing blob")
         } else if bytes.starts_with(TREE_HEADER_KEYWORD) {
-            Tree::deserialize(bytes).map(Self::Tree)
+            Tree::deserialize(bytes)
+                .map(Self::Tree)
+                .context("deserializing tree")
         } else if bytes.starts_with(COMMIT_HEADER_KEYWORD) {
-            Commit::deserialize(bytes).map(Self::Commit)
+            Commit::deserialize(bytes)
+                .map(Self::Commit)
+                .context("deserializing commit")
         } else {
             bail!(
             "wrong header (expected {}, {}, or {})",
@@ -891,6 +1003,16 @@ impl Deserialize for Object {
                 "check the definition of COMMIT_HEADER_KEYWORD: should be a UTF8 encoded string"
             )
         );
+        }
+    }
+}
+
+impl HasPayload for Object {
+    fn payload(&self) -> Vec<u8> {
+        match &self {
+            Object::Blob(blob) => blob.payload(),
+            Object::Tree(tree) => tree.payload(),
+            Object::Commit(commit) => commit.payload(),
         }
     }
 }
