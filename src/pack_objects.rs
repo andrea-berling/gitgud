@@ -202,7 +202,6 @@ impl PackedObject {
                         .resolve(&base_object_bytes[header_end_marker + 1..])
                         .context("failed to resolve ref delta")?,
                 );
-                println!("{:?}", str::from_utf8(&new_object_bytes));
                 let object = git::Object::deserialize(&new_object_bytes)
                     .context("failed to deserialize object")?;
                 ensure!(

@@ -1,8 +1,9 @@
+#![deny(clippy::cast_possible_truncation)]
 use std::{
     cmp::{min, Reverse},
     collections::{BinaryHeap, HashMap},
-    fmt::Display,
-    io::Write,
+    fmt::{Display, Write as _},
+    io::Write as _,
     iter::zip,
 };
 
@@ -107,6 +108,7 @@ impl Stream {
             self.bytes.len() - parsed_bytes >= 4,
             "missing ADLER-32 checksum"
         );
+
         let checksum: [u8; 4] = self.bytes[parsed_bytes..][..4].try_into()?;
         ensure!(
             adler32(&result) == checksum,
@@ -276,7 +278,9 @@ impl<'a> LSBBitsIterator<'a> {
             let chunk = self.buffer[byte_pos] >> shiftr;
 
             // Mask out just the bits we want
-            let mask = ((1u16 << bits_to_read_from_byte) - 1) as u8;
+            let mask: u8 = (((1u16 << bits_to_read_from_byte) - 1) & 0xff)
+                .try_into()
+                .unwrap();
             let masked_chunk = chunk & mask;
 
             // Place the chunk into the result at the correct position
@@ -377,12 +381,16 @@ impl LSBBitPacker {
             }
             let byte_pos = self.bits_written_so_far / 8;
             let shiftl = self.bits_written_so_far % 8;
-            let bits_we_can_write = min(8 - shiftl, n_bits) as u8;
-            let mask = (1 << bits_we_can_write) - 1;
+            let bits_we_can_write = min(8 - shiftl, n_bits);
+            let mask = if bits_we_can_write == 8 {
+                0xff
+            } else {
+                (1 << bits_we_can_write) - 1
+            };
 
-            self.buffer[byte_pos] |= (bits as u8 & mask) << shiftl;
-            self.bits_written_so_far += bits_we_can_write as usize;
-            n_bits -= bits_we_can_write as usize;
+            self.buffer[byte_pos] |= (u8::try_from(bits & 0xff).unwrap() & mask) << shiftl;
+            self.bits_written_so_far += bits_we_can_write;
+            n_bits -= bits_we_can_write;
             bits >>= bits_we_can_write;
         }
     }
@@ -412,7 +420,7 @@ impl LSBBitPacker {
         true
     }
 
-    fn to_vec(self) -> Vec<u8> {
+    fn into_vec(self) -> Vec<u8> {
         self.buffer
     }
 }
@@ -459,16 +467,18 @@ impl HuffmanDecompressor {
             let mut code_lsb = code.reverse_bits() >> (u16::BITS as usize - code_len);
             let mut current_node_idx = 0;
             for _ in 0..code_len {
-                let next_bit = code_lsb as u8 & 1;
+                let next_bit = code_lsb & 1;
                 match next_bit {
                     0 => {
                         if let Some(idx) = decoder[current_node_idx].left {
                             current_node_idx = idx as usize;
                         } else {
                             decoder.push(HuffmanNode::default());
-                            let new_index = decoder.len() as u16 - 1;
-                            current_node_idx =
-                                *decoder[current_node_idx].left.get_or_insert(new_index) as usize;
+                            let new_index = decoder.len() - 1;
+                            current_node_idx = *decoder[current_node_idx]
+                                .left
+                                .get_or_insert(new_index.try_into().unwrap())
+                                as usize;
                         }
                     }
                     1 => {
@@ -476,9 +486,11 @@ impl HuffmanDecompressor {
                             current_node_idx = idx as usize;
                         } else {
                             decoder.push(HuffmanNode::default());
-                            let new_index = decoder.len() as u16 - 1;
-                            current_node_idx =
-                                *decoder[current_node_idx].right.get_or_insert(new_index) as usize;
+                            let new_index = decoder.len() - 1;
+                            current_node_idx = *decoder[current_node_idx]
+                                .right
+                                .get_or_insert(new_index.try_into().unwrap())
+                                as usize;
                         }
                     }
                     _ => unreachable!(),
@@ -600,7 +612,7 @@ fn get_decoders_from_encoded_lengths(
             .copied()
             .collect::<Vec<_>>(),
     );
-    let literals_symbol_map: Vec<_> = (0..LITERALS_ALPHABET_SIZE as u16).collect();
+    let literals_symbol_map: Vec<_> = (0..u16::try_from(LITERALS_ALPHABET_SIZE).unwrap()).collect();
 
     let (literals_symbol_map, literals_codes_lengths): (Vec<u16>, Vec<usize>) =
         zip(literals_symbol_map, literals_codes_lengths)
@@ -612,13 +624,18 @@ fn get_decoders_from_encoded_lengths(
 
     let mut distances_codes_lengths = [0; DISTANCES_ALPHABET_SIZE];
 
-    distances_codes_lengths[0..n_distances_lengths].copy_from_slice(
-        &decoded_lengths
-            .iter()
-            .skip(n_literals_lengths)
-            .copied()
-            .collect::<Vec<_>>(),
-    );
+    ensure!(n_distances_lengths == decoded_lengths.len() - n_literals_lengths, "number of expected distance lenghts ({n_distances_lengths}) and actually present distance lengths ({}) don't coincide", decoded_lengths.len() - n_literals_lengths);
+
+    distances_codes_lengths
+        .get_mut(0..n_distances_lengths)
+        .context("reading distance lengths from the full list of decoded lengths")?
+        .copy_from_slice(
+            &decoded_lengths
+                .iter()
+                .skip(n_literals_lengths)
+                .copied()
+                .collect::<Vec<_>>(),
+        );
 
     // RFC 1951 Section 3.2.7, "One distance code of zero bits means that there are no distance
     // codes"
@@ -626,7 +643,8 @@ fn get_decoders_from_encoded_lengths(
         return Ok((literals_huffman_decompressor, None));
     }
 
-    let distances_symbol_map: Vec<_> = (0..DISTANCES_ALPHABET_SIZE as u16).collect();
+    let distances_symbol_map: Vec<_> =
+        (0..u16::try_from(DISTANCES_ALPHABET_SIZE).unwrap()).collect();
 
     let (distances_symbol_map, distances_codes_lengths): (Vec<u16>, Vec<usize>) =
         zip(distances_symbol_map, distances_codes_lengths)
@@ -644,21 +662,24 @@ fn get_decoders_from_encoded_lengths(
 fn huffman_codes_lengths_from_huffman_tree(
     tree: &[HuffmanNode],
     root_idx: u16,
-    depth: usize,
-) -> anyhow::Result<Vec<(usize, u16)>> {
-    ensure!(root_idx < tree.len() as u16);
+    height: usize,
+) -> anyhow::Result<CanonicalHuffmanEncoding> {
+    ensure!(tree.len() > root_idx as usize);
     let current_node = &tree[root_idx as usize];
     if current_node.is_leaf() {
-        Ok(vec![(depth, current_node.payload.unwrap())])
+        Ok(vec![EncodedSymbol {
+            symbol: current_node.payload.unwrap(),
+            len: height,
+        }])
     } else {
         let mut left = if let Some(child) = current_node.left {
-            huffman_codes_lengths_from_huffman_tree(tree, child, depth + 1)
+            huffman_codes_lengths_from_huffman_tree(tree, child, height + 1)
                 .context("computing huffman code length for left child")?
         } else {
             vec![]
         };
         let mut right = if let Some(child) = current_node.right {
-            huffman_codes_lengths_from_huffman_tree(tree, child, depth + 1)
+            huffman_codes_lengths_from_huffman_tree(tree, child, height + 1)
                 .context("computing huffman code length for right child")?
         } else {
             vec![]
@@ -668,15 +689,27 @@ fn huffman_codes_lengths_from_huffman_tree(
     }
 }
 
-// TODO: write tests
-/// Returns the lengths and the symbol map
-fn huffman_codes_lengths_from_symbols(bytes: &[u16]) -> anyhow::Result<(Vec<usize>, Vec<u16>)> {
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MergePackage {
+    /// The level of the package in the merge tree. Corresponds to the code length.
+    level: usize,
+    /// The weight of the package, equivalent to the sum of frequencies of the symbols it contains.
+    weight: usize,
+    /// The list of symbols and their original frequencies contained in this package.
+    symbols_and_freqs: Vec<(u16, usize)>,
+}
+
+/// Naive, no bound length huffman tree building algorithm
+fn naive_canonical_huffman_encoding_from_cleartext(
+    bytes: &[u16],
+) -> anyhow::Result<CanonicalHuffmanEncoding> {
     let mut frequencies = HashMap::new();
     for symbol in bytes {
         *frequencies.entry(*symbol).or_insert(0) += 1;
     }
     if frequencies.keys().len() == 1 {
-        bail!("single symbol string not supported yet")
+        let symbol = *frequencies.keys().next().unwrap();
+        return Ok(vec![EncodedSymbol { symbol, len: 1 }]);
     }
     let mut huffman_tree: Vec<_> = frequencies
         .keys()
@@ -690,49 +723,218 @@ fn huffman_codes_lengths_from_symbols(bytes: &[u16]) -> anyhow::Result<(Vec<usiz
     for (i, node) in huffman_tree.iter().enumerate() {
         priority_queue.push(Reverse((frequencies[&node.payload.unwrap()], i)));
     }
-    let mut root_idx = 0;
+    let mut root_idx = 0u16;
     while priority_queue.len() > 1 {
         let Reverse(least_frequent) = priority_queue.pop().unwrap();
         let Reverse(second_least_frequent) = priority_queue.pop().unwrap();
         let root = HuffmanNode {
-            left: Some(second_least_frequent.1 as u16),
-            right: Some(least_frequent.1 as u16),
+            left: Some(
+                second_least_frequent
+                    .1
+                    .try_into()
+                    .context("trying to fit a tree pointer into a u16")?,
+            ),
+            right: Some(
+                least_frequent
+                    .1
+                    .try_into()
+                    .context("trying to fit a tree pointer into a u16")?,
+            ),
             payload: None,
         };
         huffman_tree.push(root);
-        root_idx = huffman_tree.len() as u16 - 1;
+        root_idx = u16::try_from(huffman_tree.len())
+            .context("trying to fit a tree pointer into a u16")?
+            - 1;
         priority_queue.push(Reverse((
             least_frequent.0 + second_least_frequent.0,
             huffman_tree.len() - 1,
         )));
     }
-    let mut huffman_code_lengths =
-        huffman_codes_lengths_from_huffman_tree(&huffman_tree, root_idx, 0)
-            .context("computing huffman codes lengths")?;
-    // Canonical Huffman tree expect lexicographic order in the codes assigned to symbols
-    huffman_code_lengths.sort_by(|(_, code1), (_, code2)| code1.cmp(code2));
 
-    Ok(huffman_code_lengths.into_iter().unzip())
+    // eprintln!("{}", to_graphviz(&huffman_tree, root_idx));
+
+    let mut huffman_encoding = huffman_codes_lengths_from_huffman_tree(&huffman_tree, root_idx, 0)
+        .context("computing huffman codes lengths")?;
+    // Canonical Huffman tree expect lexicographic order in the codes assigned to symbols
+    huffman_encoding.sort_by_key(|encoded_symbol| encoded_symbol.symbol);
+
+    Ok(huffman_encoding)
+}
+
+const RFC_1951_MAX_LIT_CODE_LEN: usize = 15;
+const RFC_1951_MAX_CODE_LEN_ENCODING_CODE_LEN: usize = 7;
+
+/// Computes the optimal Huffman encoding for the bytes in the given slice using their frequency,
+/// respecting a maximum code length.
+///
+/// This function implements a variant of the package-merge algorithm.
+fn canonical_huffman_encoding_from_cleartext(
+    bytes: &[u16],
+    max_code_len: usize,
+) -> anyhow::Result<CanonicalHuffmanEncoding> {
+    let mut frequencies = HashMap::new();
+    for symbol in bytes {
+        *frequencies.entry(*symbol).or_insert(0) += 1;
+    }
+    let n_symbols = frequencies.keys().len();
+    if n_symbols == 0 {
+        return Ok(vec![]);
+    }
+    if n_symbols == 1 {
+        let symbol = *frequencies.keys().next().unwrap();
+        return Ok(vec![EncodedSymbol { symbol, len: 1 }]);
+    }
+
+    let mut priority_queue = BinaryHeap::new();
+    for (&symbol, &frequency) in &frequencies {
+        for level in 1..=max_code_len {
+            priority_queue.push(Reverse(MergePackage {
+                level,
+                weight: frequency,
+                symbols_and_freqs: vec![(symbol, frequency)],
+            }));
+        }
+    }
+
+    let mut final_packages = BinaryHeap::new();
+    while let Some(Reverse(mut smallest)) = priority_queue.pop() {
+        if smallest.level == max_code_len + 1 {
+            final_packages.push(Reverse(smallest));
+            continue;
+        }
+        let Some(Reverse(mut second_smallest)) = priority_queue.pop() else {
+            break;
+        };
+        if smallest.level != second_smallest.level {
+            priority_queue.push(Reverse(second_smallest));
+            continue;
+        }
+
+        smallest
+            .symbols_and_freqs
+            .append(&mut second_smallest.symbols_and_freqs);
+
+        let new_package = MergePackage {
+            level: smallest.level + 1,
+            weight: smallest.weight + second_smallest.weight,
+            symbols_and_freqs: smallest.symbols_and_freqs,
+        };
+        priority_queue.push(Reverse(new_package));
+    }
+
+    // The logic below determines the code length for each symbol.
+    // It inspects the `n-1` most significant packages that were finalized.
+    // The code length of a symbol is the number of times it appears in these packages.
+    let mut code_lengths = HashMap::new();
+    for package in final_packages.into_iter().take(n_symbols - 1) {
+        for &(symbol, _) in &package.0.symbols_and_freqs {
+            *code_lengths.entry(symbol).or_insert(0) += 1;
+        }
+    }
+
+    let mut huffman_encoding: Vec<_> = code_lengths
+        .into_iter()
+        .map(|(symbol, len)| EncodedSymbol { symbol, len })
+        .collect();
+
+    ensure!(
+        huffman_encoding.len() == n_symbols,
+        "The number of symbols with assigned code lengths does not match the number of unique symbols in the input."
+    );
+
+    // Canonical Huffman trees require codes to be assigned based on a lexicographically
+    // sorted symbol alphabet.
+    huffman_encoding.sort_by_key(|encoded_symbol| encoded_symbol.symbol);
+
+    Ok(huffman_encoding)
+}
+
+fn to_graphviz(huffman_tree: &[HuffmanNode], root_idx: u16) -> String {
+    let mut ret = String::new();
+    writeln!(&mut ret, "digraph G {{").unwrap();
+    writeln!(&mut ret, "    rankdir=TB;").unwrap();
+    writeln!(&mut ret, "    node [shape=circle];").unwrap();
+    let mut nodes_to_visit = vec![(root_idx, None, None)];
+    let mut node_counter = 0;
+    while let Some((node_idx, parent, parent_branch_label)) = nodes_to_visit.pop() {
+        let current_node = &huffman_tree[node_idx as usize];
+        if current_node.is_leaf() {
+            writeln!(
+                &mut ret,
+                "    n{node_counter} [label=\"{:#04x} = {}{}\", shape=box];\n    n{} -> n{node_counter} [label=\"{}\"];",
+                current_node.payload.unwrap(),
+                current_node.payload.unwrap(),
+                if let Ok(byte) = u8::try_from(current_node.payload.unwrap()) {
+                    if byte.is_ascii() {
+                        format!(" '{}'",byte.escape_ascii())
+                    }
+                    else {
+                        String::new()
+                    }
+                }
+                else {
+                    String::new()
+                },
+                parent.unwrap(),
+                parent_branch_label.unwrap(),
+            ).unwrap();
+        } else {
+            writeln!(&mut ret, "    n{node_counter} [label=\"\", shape=circle];",).unwrap();
+            if let Some(parent) = parent {
+                writeln!(
+                    &mut ret,
+                    "    n{} -> n{node_counter} [label=\"{}\"];",
+                    parent,
+                    parent_branch_label.unwrap()
+                )
+                .unwrap();
+            }
+            if let Some(child) = current_node.right {
+                nodes_to_visit.push((child, Some(node_counter), Some("1")));
+            }
+            if let Some(child) = current_node.left {
+                nodes_to_visit.push((child, Some(node_counter), Some("0")));
+            }
+        }
+        node_counter += 1;
+    }
+    writeln!(&mut ret, "    edge [arrowhead=none];").unwrap();
+    writeln!(&mut ret, "}}").unwrap();
+    ret
 }
 
 struct HuffmanCompressor {
-    encoder: Vec<(u16, usize)>,
+    encoder: Vec<Option<(u16, usize)>>,
 }
 
 impl HuffmanCompressor {
-    fn new(code_lengths: &[usize], symbol_map: &[u16]) -> Self {
-        // TODO: put a better number than 300 here
-        let mut encoder = vec![(0, 0); 300];
-        for (i, &code) in huffman_codes(code_lengths).iter().enumerate() {
-            encoder[symbol_map[i] as usize] = (code, code_lengths[i])
+    fn new(encoding: &CanonicalHuffmanEncoding) -> Self {
+        let mut encoder = vec![None; LITERALS_ALPHABET_SIZE];
+        let code_lengths: Vec<_> = encoding
+            .iter()
+            .map(|encoded_symbol| encoded_symbol.len)
+            .collect();
+        for (i, &code) in huffman_codes(&code_lengths).iter().enumerate() {
+            encoder[encoding[i].symbol as usize] = Some((code, encoding[i].len))
         }
         Self { encoder }
     }
 
     #[inline]
     fn encode(&self, symbol: u16) -> anyhow::Result<(u16, usize)> {
-        ensure!(symbol < self.encoder.len().try_into().context("TODO")?);
-        Ok(self.encoder[symbol as usize])
+        ensure!(
+            symbol
+                < self
+                    .encoder
+                    .len()
+                    .try_into()
+                    .context("failed to convert encoder length to u16")?,
+            "symbol out of bounds for the encoder"
+        );
+        self.encoder[symbol as usize].ok_or(anyhow::anyhow!(
+            "a symbol that is not part of the encoder's table has been provided: {symbol:#x}"
+        ))
     }
 }
 
@@ -747,7 +949,7 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
         CompressionLevel::Lowest => {
             ensure!(bytes.len() < u16::MAX as usize);
             result.write_all(b"\x01")?;
-            let len = bytes.len() as u16;
+            let len: u16 = bytes.len().try_into().unwrap();
             result.write_all(&len.to_le_bytes())?;
             result.write_all(&(!len).to_le_bytes())?;
             result.write_all(bytes)?;
@@ -759,44 +961,44 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             // We only have one block, and thus one end of data
             // marker
             symbols.push(256);
-            let (main_huffman_code_lengths, main_huffman_symbol_map) =
-                huffman_codes_lengths_from_symbols(&symbols)
+            // No distance codes used, so we push a single 0 that will be used later to represent
+            // the single 0 code length for the encoded distance codes
+            symbols.push(0);
+            let main_huffman_encoding =
+                canonical_huffman_encoding_from_cleartext(&symbols, RFC_1951_MAX_LIT_CODE_LEN)
                     .context("computing huffman code lengths for the bytes")?;
-            let mut hlit_array = vec![0; 257];
-            for i in 0..main_huffman_symbol_map.len() {
-                hlit_array[main_huffman_symbol_map[i] as usize] = main_huffman_code_lengths[i];
+            //eprintln!("main_huffman_encoding = {main_huffman_encoding:#?}");
+            let mut lengths_to_encode = vec![0; 258];
+            for &EncodedSymbol { symbol, len } in &main_huffman_encoding {
+                lengths_to_encode[symbol as usize] = len;
             }
-            let hlit = hlit_array.len() - 257;
-            // No distance codes used
-            let compact_distance_codes = [EncodedLength::Literal(0)];
+            // eprintln!("lengths_to_encode = {lengths_to_encode:?}");
+            let hlit = 0;
             let hdist = 0;
-            let (
-                compact_code_lengths,
-                (code_lengths_encoding_code_lengths, code_lengths_symbol_map),
-            ) = code_lengths_encoding_code_lengths(&hlit_array)
-                .context("computing the length of codes used to encode code lengths")?;
+            let (compact_code_lengths, code_lengths_huffman_encoding) =
+                code_lengths_encoding_code_lengths(&lengths_to_encode)
+                    .context("computing the length of codes used to encode code lengths")?;
             let mut hclen_array = vec![0; CODE_LENGTHS_SYMBOL_MAP.len()];
-            for i in 0..code_lengths_symbol_map.len() {
-                hclen_array[CODE_LENGTHS_INVERSE_SYMBOL_MAP[code_lengths_symbol_map[i] as usize]
-                    as usize] = code_lengths_encoding_code_lengths[i];
+            //eprintln!("code_lenghts_huffman_encoding = {code_lengths_huffman_encoding:#?}");
+            for &EncodedSymbol { symbol, len } in &code_lengths_huffman_encoding {
+                // These lengths are packed in the sequence given by CODE_LENGTHS_SYMBOL_MAP
+                hclen_array[CODE_LENGTHS_INVERSE_SYMBOL_MAP[symbol as usize] as usize] = len;
             }
 
             let hclen_array_end = hclen_array
                 .iter()
                 .rposition(|&x| x != 0)
-                .ok_or(anyhow::anyhow!("TODO"))?
+                .context("hclen_array should not be empty")?
                 + 1;
             hclen_array.truncate(hclen_array_end);
 
+            // eprintln!("compact_code_lengths = {compact_code_lengths:#?}");
+
             let hclen = hclen_array.len() - 4;
 
-            let code_lengths_compressor = HuffmanCompressor::new(
-                &code_lengths_encoding_code_lengths,
-                &code_lengths_symbol_map,
-            );
+            let code_lengths_compressor = HuffmanCompressor::new(&code_lengths_huffman_encoding);
 
-            let main_compressor =
-                HuffmanCompressor::new(&main_huffman_code_lengths, &main_huffman_symbol_map);
+            let main_compressor = HuffmanCompressor::new(&main_huffman_encoding);
 
             let mut bit_packer = LSBBitPacker::new();
             bit_packer.push_bits(
@@ -806,28 +1008,28 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             bit_packer.push_bits(hlit as u64, 5);
             bit_packer.push_bits(hdist as u64, 5);
             bit_packer.push_bits(hclen as u64, 4);
+
             for &len in &hclen_array {
                 bit_packer.push_bits(len as u64, 3);
             }
+            // eprintln!("compact codes: {}", compact_code_lengths.len());
             for &encoded_code_len in &compact_code_lengths {
                 encoded_code_len
                     .compress(&mut bit_packer, &code_lengths_compressor)
-                    .context("TODO")?
-            }
-            for encoded_code_len in &compact_distance_codes {
-                encoded_code_len
-                    .compress(&mut bit_packer, &code_lengths_compressor)
-                    .context("TODO")?
+                    .context("encoding code lengths")?
             }
             for &byte in bytes {
-                let (code, code_len) = main_compressor.encode(byte as u16).context("TODO")?;
+                let (code, code_len) = main_compressor
+                    .encode(byte as u16)
+                    .context("encoding each input byte")?;
                 bit_packer.push_reversed_bits(code as u64, code_len);
             }
 
-            let (end_block_code, end_block_code_len) =
-                main_compressor.encode(256).context("TODO")?;
-            bit_packer.push_bits(end_block_code as u64, end_block_code_len);
-            result = bit_packer.to_vec();
+            let (end_block_code, end_block_code_len) = main_compressor
+                .encode(256)
+                .context("encoding the end of block symbol")?;
+            bit_packer.push_reversed_bits(end_block_code as u64, end_block_code_len);
+            result = bit_packer.into_vec();
         }
         CompressionLevel::Medium => panic!("not implemented"),
         CompressionLevel::Highest => panic!("not implemented"),
@@ -861,69 +1063,119 @@ impl EncodedLength {
     ) -> anyhow::Result<()> {
         match self {
             EncodedLength::Literal(n) => {
-                let (code, code_len) = compressor.encode(n as u16).context("TODO")?;
+                let (code, code_len) = compressor.encode(n as u16).context("encoding literal")?;
+
                 bit_packer.push_reversed_bits(code as u64, code_len);
             }
             EncodedLength::RepeatPrevious(count) => {
-                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                let (code, code_len) = compressor
+                    .encode(self.to_code() as u16)
+                    .context("encoding repeat previous sequence")?;
                 bit_packer.push_reversed_bits(code as u64, code_len);
-                bit_packer.push_bits(count as u64, 2);
+                bit_packer.push_bits(
+                    (count as u64)
+                        .checked_sub(3)
+                        .context("encoding repeat previous sequence")?,
+                    2,
+                );
             }
             EncodedLength::RepeatShortSequenceOfZeros(count) => {
-                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                let (code, code_len) = compressor
+                    .encode(self.to_code() as u16)
+                    .context("encoding short repeat zeros sequence")?;
                 bit_packer.push_reversed_bits(code as u64, code_len);
-                bit_packer.push_bits(count as u64 - 3, 3);
+                bit_packer.push_bits(
+                    (count as u64)
+                        .checked_sub(3).ok_or(anyhow::anyhow!("subtraction with underflow while trying to encode a short repeat zeroes sequence" ))?,
+                    3,
+                );
             }
             EncodedLength::RepeatLongSequenceOfZeros(count) => {
-                let (code, code_len) = compressor.encode(self.to_code() as u16).context("TODO")?;
+                let (code, code_len) = compressor
+                    .encode(self.to_code() as u16)
+                    .context("encoding short repeat zeros sequence")?;
                 bit_packer.push_reversed_bits(code as u64, code_len);
-                bit_packer.push_bits(count as u64 - 11, 7);
+                bit_packer.push_bits(
+                    (count as u64)
+                        .checked_sub(11).ok_or(anyhow::anyhow!("subtraction with underflow while trying to encode a long repeat zeroes sequence" ))?,
+                    7,
+                );
             }
         }
         Ok(())
     }
 }
 
+#[derive(Debug)]
+struct EncodedSymbol {
+    symbol: u16,
+    len: usize,
+}
+
+type CanonicalHuffmanEncoding = Vec<EncodedSymbol>;
+
+/// Compacts the given array of code lengths for literals and LZ lengths, and then computes the
+/// code lengths for the Section 3.2.7 encoding of those lengths
+/// The array `lengths_to_encode` should be an array with exactly the logical layout the HLIT array
+/// would have at the start of the compressed block
+/// Returns a compacted code length array, where runs of repeated elements may be substituted by a
+/// run-length representation, as well as a list of code lengths and corrending symbols (i.e. a
+/// symbol map)
 fn code_lengths_encoding_code_lengths(
-    hlit_array: &[usize],
-) -> anyhow::Result<(Vec<EncodedLength>, (Vec<usize>, Vec<u16>))> {
-    if hlit_array.len() == 1 {
+    lengths_to_encode: &[usize],
+) -> anyhow::Result<(Vec<EncodedLength>, CanonicalHuffmanEncoding)> {
+    if lengths_to_encode.len() == 1 {
         bail!("hlit array with single element not supported yet");
     }
-    let mut compact_huffman_code_lengths_pass_1 = vec![];
-    for &code_length in hlit_array {
-        compact_huffman_code_lengths_pass_1.push(EncodedLength::Literal(
-            code_length.try_into().context("code length does not fit in u8")?,
-        ));
-    }
     let mut compact_huffman_code_lengths = vec![];
-    for encoded_length_run in compact_huffman_code_lengths_pass_1.chunk_by(|a, b| a == b) {
-        let run_length: u8 = encoded_length_run
-            .len()
-            .try_into()
-            .context("run length does not fit in u8")?;
-        let EncodedLength::Literal(lit) = encoded_length_run[0] else {
-            unreachable!()
-        };
-        if lit != 0 {
-            if encoded_length_run.len() >= 3 {
-                compact_huffman_code_lengths.extend([
-                    encoded_length_run[0],
-                    EncodedLength::RepeatPrevious(run_length - 1),
-                ]);
-            } else {
-                compact_huffman_code_lengths.extend(encoded_length_run);
+    for length_run in lengths_to_encode.chunk_by(|a, b| a == b) {
+        if length_run[0] != 0 {
+            // 6 is the max len for a non-zero repetition in section 3.2.7
+            // However, a repetition is made of symbol + <n-repetitions>, thus, if we have a run of 7
+            // copies of symbol X, then <X,6> would be a compact way to represent it
+            // Thus, we want to look at runs of 7
+            for chunk in length_run.chunks(7) {
+                if chunk.len() >= 4 {
+                    compact_huffman_code_lengths.extend([
+                        EncodedLength::Literal(
+                            length_run[0]
+                                .try_into()
+                                .context("trying to fit a code length into a u8")?,
+                        ),
+                        EncodedLength::RepeatPrevious(
+                            u8::try_from(chunk.len()).context("chunk length does not fit in u8")? - 1,
+                        ),
+                    ]);
+                } else {
+                    for &len in chunk {
+                        compact_huffman_code_lengths
+                            .push(EncodedLength::Literal(u8::try_from(len).context("code length does not fit in u8")?));
+                    }
+                }
             }
-        } else if encoded_length_run.len() >= 3 {
-            if encoded_length_run.len() >= 11 {
-                compact_huffman_code_lengths
-                    .push(EncodedLength::RepeatLongSequenceOfZeros(run_length));
-            } else {
-                compact_huffman_code_lengths
-                    .push(EncodedLength::RepeatShortSequenceOfZeros(run_length));
+        } else if length_run.len() >= 3 {
+            // 138 is the max len for a zero repetition in section 3.2.7
+            for chunk in length_run.chunks(138) {
+                if chunk.len() >= 11 {
+                    compact_huffman_code_lengths.push(EncodedLength::RepeatLongSequenceOfZeros(
+                        chunk.len().try_into().context("chunk length does not fit in u8")?,
+                    ));
+                } else if chunk.len() >= 3 {
+                    compact_huffman_code_lengths.push(EncodedLength::RepeatShortSequenceOfZeros(
+                        chunk.len().try_into().context("chunk length does not fit in u8")?,
+                    ));
+                } else {
+                    for &len in chunk {
+                        compact_huffman_code_lengths
+                            .push(EncodedLength::Literal(len.try_into().context("TODO")?));
+                    }
+                }
             }
         } else {
-            compact_huffman_code_lengths.extend(encoded_length_run);
+            for &len in length_run {
+                compact_huffman_code_lengths
+                    .push(EncodedLength::Literal(len.try_into().context("TODO")?));
+            }
         }
     }
 
@@ -931,17 +1183,26 @@ fn code_lengths_encoding_code_lengths(
         .iter()
         .map(|code_length| code_length.to_code() as u16)
         .collect();
-    let (huffman_code_lengths, symbol_map) = huffman_codes_lengths_from_symbols(&used_lengths)
-        .context("computing huffman codes for used lengths")?;
-
-    // Canonical Huffman tree expect lexicographic order in the codes assigned to symbols
-    let mut huffman_lengths_and_map: Vec<_> = zip(huffman_code_lengths, symbol_map)
-        .filter(|(len, _)| *len != 0)
-        .collect();
-    huffman_lengths_and_map.sort_by_key(|x| x.1);
+    let total_len = compact_huffman_code_lengths
+        .iter()
+        .fold(0usize, |acc, encoded_length| {
+            acc + match encoded_length {
+                EncodedLength::Literal(_) => 1,
+                &(EncodedLength::RepeatPrevious(count)
+                | EncodedLength::RepeatShortSequenceOfZeros(count)
+                | EncodedLength::RepeatLongSequenceOfZeros(count)) => count,
+            } as usize
+        });
+    // eprintln!(
+    //     "compact_huffman_code_lengths (len: {total_len}) = {compact_huffman_code_lengths:#?}"
+    // );
     Ok((
         compact_huffman_code_lengths,
-        huffman_lengths_and_map.into_iter().unzip(),
+        canonical_huffman_encoding_from_cleartext(
+            &used_lengths,
+            RFC_1951_MAX_CODE_LEN_ENCODING_CODE_LEN,
+        )
+        .context("computing huffman codes for used lengths")?,
     ))
 }
 
@@ -951,14 +1212,19 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
 
     let fixed_huffman_decompressor = HuffmanDecompressor::new(
         &FIXED_HUFFMAN_LITERALS_CODES_LENGTHS,
-        &(0..FIXED_HUFFMAN_LITERALS_CODES_LENGTHS.len() as u16).collect::<Vec<_>>(),
+        &(0..u16::try_from(FIXED_HUFFMAN_LITERALS_CODES_LENGTHS.len()).unwrap())
+            .collect::<Vec<_>>(),
     );
 
     loop {
-        let block_header = lsb_iterator.pop_bits(3).ok_or(anyhow::anyhow!(format!(
-            "not enough bits at {}: failed to read block header (3 bits)",
-            lsb_iterator.bit_cursor()
-        )))?;
+        let block_header: u8 = lsb_iterator
+            .pop_bits(3)
+            .ok_or(anyhow::anyhow!(format!(
+                "not enough bits at {}: failed to read block header (3 bits)",
+                lsb_iterator.bit_cursor()
+            )))?
+            .try_into()
+            .unwrap();
         let last = (block_header & 1) == 1;
         let block_type = (block_header as u8 >> 1).into();
         match block_type {
@@ -991,7 +1257,7 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                         .huffman_decode(&fixed_huffman_decompressor)
                         .context("decoding bits with the fixed huffman decoder")?;
                     match compressed_block_literal {
-                        0..=255 => result.push(compressed_block_literal as u8),
+                        0..=255 => result.push(compressed_block_literal.try_into()?),
                         256 => break, // end of block
                         257..=285 => {
                             let n_extra_bits_for_len =
@@ -1058,7 +1324,7 @@ fn inflate(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize)> {
                         .context("decoding dynamic literals")?;
                     match compressed_block_literal {
                         0..=255 => {
-                            result.push(compressed_block_literal as u8);
+                            result.push(compressed_block_literal.try_into()?);
                         }
                         256 => break, // end of block
                         257..=285 => {
@@ -1206,7 +1472,12 @@ fn len_code_to_first_len(code: u16) -> anyhow::Result<u16> {
     let length_group_start = length_group_base + CODED_LENGTHS_Y_OFFSET;
 
     // Calculate the final offset within the length group.
-    let length_offset = code_index_in_group * 2u16.pow(extra_bits as u32);
+    let length_offset = code_index_in_group
+        * 2u16.pow(
+            extra_bits
+                .try_into()
+                .context("trying to fit the extra bits provided into a u32")?,
+        );
 
     Ok(length_group_start + length_offset)
 }
@@ -1246,7 +1517,12 @@ fn distance_code_to_first_distance(code: u16) -> anyhow::Result<u16> {
     let distance_group_start = distance_group_base + CODED_DISTANCES_Y_OFFSET;
 
     // Calculate the final offset within the length group.
-    let distance_offset = code_index_in_group * 2u16.pow(extra_bits as u32);
+    let distance_offset = code_index_in_group
+        * 2u16.pow(
+            extra_bits
+                .try_into()
+                .context("trying to fit the extra bits provided into a u32")?,
+        );
 
     Ok(distance_group_start + distance_offset)
 }
@@ -1262,6 +1538,8 @@ fn n_extra_bits_for_distance_code(code: u16) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread::sleep_ms;
+
     use super::*;
 
     const COMPRESSED_HELLO: &[u8] =
@@ -1281,6 +1559,20 @@ mod tests {
     const COMPRESSED_GIT_COMMIT_DYNAMIC: &[u8] = b"x\x01\xad\x94MO\xdc0\x10\x86{\xce\xaf\x98S\x05\x94\r\xd9e?QU\x15\xe8\x07H\xadz\x00\xce\xb5=\x9e$.\x89\xbd\xb2\'\xc0\xf6\xd7Wv\xb2\xcb\x828\xf6\x14y\x9c\xbc3\xf3\xbc3A\xd7\xb6\x86a<-&\xef\xd8\x13\xc1\\/Vr\xa9\n\x9c\x16j\xb9\x9a\xc9\xc9\xa2\x9c\x95\n\xb5\x9a\xce\x968Y\x15j*O\xd5XR\xb6\x96\x9e,\xc3b\xa2\xd5\xaa\x9c\x11\xcdQ\xa9\xf9\xb2\x18#\xaa\xf1).K\xc4\xf9j>\xd7KU.f\xb8\\d\xb2\xe3\xday8\xb7\xda\x93\x84\x0b\xf2\x8d\xb1\x95!o\xe0\xa3L\xb1\x91\xeac\x9f\xbb@>\xe4\xd6yZ7\x9b\xbc2\\w*G\xd7~\x82\xf1bv:.V\xab\xe9\x0c>\x14\x93\xa2\xc80\x95\xcf\xf4\xbfu\xb3\x92$\x9f\xc1u\xbbn\xa8\x8dm~7\x0cN\xfd!d\xa8\xa5\xd5\xb1v\x90V\x83x\xf4\x86i\x14\xd1\t\x88\xd5H\xab\xb3\xec\xda\xb2w\xbaC\n1\xb6\xf6T\x93\r\xe6\x81\xde\x94)\x9d\x07\xd58\x15\x92`T\n\xc7\x99\xb1\xd8t:f\t\xe4\x8dl\xcc_\xc9\xc6\xd9c\xd0\xf4*\x10\xab\xb8\xb9:\x1f\x8d\xa1\x96\xa16\xb6\xca\xe1\xb66!\xf3TJd\xe7\xa3\x06\x92e\x1fE(l\xbbh\\e\x10\x1e\r\xd7\xc6\x82\x08\x1eO*\xc3\xb9\x0f\"\t\x1a\xcbTy\xc9\x142\xc3\xf1\xe4\x80k\x82V\x1a\x0b\x97?\xae\xb7\x9d\x86<\xcbFpt\xb4\xff\xfd\xd1\xd1Y\x06\x000\x82s\xadI\x83\xb8h\x9c\x12\xc7 n#\xa3\xe1\xf9\xd5\xb2\xdf\xbc8\xfct:\xde&\xa6\xbf\x12h\x91d\x00\x02\xfb\x0e9\x9c\x90\xed\xda\x90hyZ{\nd9\xf6\xf6\xecL\xc8\x87\xc4;\xdbb\xfa/;`\xd4\xf7&\xbey\xd7\xde\xd4r|EO\x02\xd8K\xc3\xbdl\xef\xef\x90\xf5\x15g(\xbdk\xf78\xd3.Y\xdfeK\\;\xbd\xaf\xf3\xd288\x10[\xdfH\x1c\x1e\x0fJ\xdaT\x14\xb6\x19Q6\xd85\xc9f8\x10\xfdU|5\"AO\xfdE*\xa34\r\xc1Zr\x1d\x86b\x0fD\x8c\xff\x8e!q\xb8\xa5p\xc7&:\xaeA\x94\x12\x91B\x10\x80\xd1\xd2\x84\x10k\xc2\xfb\x88/i\xd1\x13a\xc7R\x99\xc6\xf0\x06\x8c\x1dd\x93e\xc9\xaa\xe4N\xfe\xecu\x1c\x848,\xcff\xdf\xad\xb5L\xbcQ\xf2(\x8aFw\xe3D\x8ez\xac[o\x9b\xf0rY\x02\xb0\x1b\xd25\xf4@^V\x94F\xcd\xd2\xe3\x9e\xb5\xcfK\xd7\xcfm\xc2\xb0?u\xdb\xa6w\x9b\xa7A&\x8d\xb7\x16\x14\xd8\xf5D\tdZ\xb8\xedRD\xd9\xa1\x988\xee\xd8\xf9\xf4\x8f{t>\xb1\xd2\xc6S\\\xa9\xcd@\xe2R\xfa\xca\xe5\xec\xdaF\xc0{\x18\x8e\x8d\xc3\xfb=.\xc3\x12\xec,\x90a(L\xd3\x9a\xac&\x8b\x9b<\xfb\x07\r3\xda[";
 
     const COMPRESSED_BLOB_MULTI_BLOCK: &[u8] = b"\x78\x01\x4a\xca\xc9\x4f\x52\x30\x35\x62\x28\x4a\x2c\x2e\x48\x4a\x2d\x2a\xaa\x54\x28\x2e\x29\x4a\x2c\x87\x30\xd3\x8b\x12\x0b\x52\x15\x12\x0b\x0a\x72\x52\x15\x0a\x32\xf3\x52\x21\xac\xa4\x9c\xd2\x54\xb0\x3c\x20\x00\x00\xff\xff\x9d\x9c\x16\xa1";
+
+    // This string will stress the encoding of repeat sequences using the code length encoding from
+    // section 3.2.7
+    const UNCOMPRESSED_FILE_WITH_CODE_LENGTHS_REPEAT_SEQUENCES: &str = r#"#!/bin/sh
+#
+# This script is used to run your program on CodeCrafters
+#
+# This runs after .codecrafters/compile.sh
+#
+# Learn more: https://codecrafters.io/program-interface
+
+set -e # Exit on failure
+
+exec zig-out/bin/main "$@""#;
 
     #[test]
     fn test_adler32_empty() {
@@ -1450,22 +1742,215 @@ mod tests {
 
     #[test]
     fn test_round_trip() {
-        let value_to_compress = b"hello world";
-        for level in [CompressionLevel::Lowest, CompressionLevel::Low] {
-            let mut stream: Stream = Stream::new(
-                CompressionMethod::DEFLATE(2 << 7),
-                None,
-                level,
-                value_to_compress.to_vec(),
-            )
-            .deflate()
-            .unwrap()
-            .try_into()
-            .unwrap();
-            assert_eq!(
-                value_to_compress,
-                &stream.inflate().unwrap(),
-                "round trip failed for compression level {level:?}"
+        let values_to_compress = [
+            b"hello world",
+            UNCOMPRESSED_FILE_WITH_CODE_LENGTHS_REPEAT_SEQUENCES.as_bytes(),
+        ];
+        for value_to_compress in &values_to_compress {
+            for level in [CompressionLevel::Lowest, CompressionLevel::Low] {
+                let mut stream: Stream = Stream::new(
+                    CompressionMethod::DEFLATE(2 << 7),
+                    None,
+                    level,
+                    value_to_compress.to_vec(),
+                )
+                .deflate()
+                .unwrap()
+                .try_into()
+                .unwrap();
+                assert_eq!(
+                    value_to_compress,
+                    &stream.inflate().unwrap(),
+                    "round trip failed for compression level {level:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lsb_bit_packer() {
+        let mut packer = LSBBitPacker::new();
+        packer.push_bits(0b101, 3);
+        packer.push_bits(0b11, 2);
+        packer.push_bits(0b1, 1);
+        packer.push_bits(0b10, 2);
+        assert_eq!(packer.into_vec(), vec![0b10111101]);
+    }
+
+    #[test]
+    fn test_lsb_bit_packer_reversed() {
+        let mut packer = LSBBitPacker::new();
+        packer.push_reversed_bits(0b101, 3); // 101
+        packer.push_reversed_bits(0b11, 2); // 11
+        packer.push_reversed_bits(0b1, 1); // 1
+        packer.push_reversed_bits(0b10, 2); // 01
+        assert_eq!(packer.into_vec(), vec![0b01111101]);
+    }
+
+    #[test]
+    fn test_lsb_bits_iterator() {
+        let data = [0b10110101, 0b01111101];
+        let mut iterator = LSBBitsIterator::new(&data);
+        assert_eq!(iterator.pop_bits(3), Some(0b101));
+        assert_eq!(iterator.pop_bits(2), Some(0b10));
+        assert_eq!(iterator.pop_bits(1), Some(0b1));
+        assert_eq!(iterator.pop_bits(2), Some(0b10));
+        assert_eq!(iterator.pop_reversed_bits(3), Some(0b101));
+        assert_eq!(iterator.pop_reversed_bits(2), Some(0b11));
+        assert_eq!(iterator.pop_reversed_bits(1), Some(0b1));
+        assert_eq!(iterator.pop_reversed_bits(2), Some(0b10));
+        assert!(iterator.pop_bit().is_none());
+    }
+
+    #[test]
+    fn test_canonical_huffman_encoding() {
+        let text = b"hello world";
+        let symbols: Vec<u16> = text.iter().map(|&b| b as u16).collect();
+        let encoding = canonical_huffman_encoding_from_cleartext(
+            &symbols,
+            RFC_1951_MAX_CODE_LEN_ENCODING_CODE_LEN,
+        )
+        .unwrap();
+
+        let mut encoding_map = std::collections::HashMap::new();
+        for enc in &encoding {
+            encoding_map.insert(enc.symbol, enc.len);
+        }
+
+        // Frequencies: h:1, e:1, l:3, o:2, ' ':1, w:1, r:1, d:1
+        // 'l' should have a short code length.
+        // 'h', 'e', ' ', 'w', 'r', 'd' should have longer code lengths.
+        // 'o' should have a medium code length.
+        //dbg!(&encoding);
+        let l_len = encoding_map[&(b'l' as u16)];
+        let o_len = encoding_map[&(b'o' as u16)];
+        let h_len = encoding_map[&(b'h' as u16)];
+
+        assert!(
+            l_len <= o_len,
+            "l_len: {l_len}, o_len: {o_len} (full encoding: {encoding_map:?})"
+        );
+        assert!(
+            o_len <= h_len,
+            "o_len: {o_len}, h_len: {h_len} (full encoding: {encoding_map:?})"
+        );
+    }
+
+    #[test]
+    fn test_huffman_compressor_decompressor_roundtrip() {
+        let text = b"a very long text to test huffman coding";
+        let symbols: Vec<u16> = text.iter().map(|&b| b as u16).collect();
+        let canonical_encoding = canonical_huffman_encoding_from_cleartext(
+            &symbols,
+            RFC_1951_MAX_CODE_LEN_ENCODING_CODE_LEN,
+        )
+        .unwrap();
+
+        let compressor = HuffmanCompressor::new(&canonical_encoding);
+
+        let code_lengths: Vec<_> = canonical_encoding.iter().map(|es| es.len).collect();
+        let symbol_map: Vec<_> = canonical_encoding.iter().map(|es| es.symbol).collect();
+        let decompressor = HuffmanDecompressor::new(&code_lengths, &symbol_map);
+
+        let mut bit_packer = LSBBitPacker::new();
+        for &symbol in &symbols {
+            let (code, len) = compressor.encode(symbol).unwrap();
+            bit_packer.push_reversed_bits(code as u64, len);
+        }
+
+        let compressed_data = bit_packer.into_vec();
+        let mut lsb_iterator = LSBBitsIterator::new(&compressed_data);
+
+        let mut decompressed_symbols = vec![];
+        for _ in 0..symbols.len() {
+            let symbol = lsb_iterator.huffman_decode(&decompressor).unwrap();
+            decompressed_symbols.push(symbol);
+        }
+
+        assert_eq!(symbols, decompressed_symbols);
+    }
+
+    #[test]
+    fn test_code_lengths_encoding_simple() {
+        // A simple set of code lengths for literals.
+        let lengths_to_encode = vec![3, 3, 3, 3, 4, 4, 0, 0, 0, 0, 0];
+
+        let (compacted, _encoding) =
+            code_lengths_encoding_code_lengths(&lengths_to_encode).unwrap();
+
+        // Expected compaction:
+        // Run of four 3s -> Literal(3), RepeatPrevious(3)
+        // Run of two 4s -> Literal(4), Literal(4)
+        // Run of five 0s -> RepeatShortSequenceOfZeros(5)
+        let expected_compacted = vec![
+            EncodedLength::Literal(3),
+            EncodedLength::RepeatPrevious(3),
+            EncodedLength::Literal(4),
+            EncodedLength::Literal(4),
+            EncodedLength::RepeatShortSequenceOfZeros(5),
+        ];
+
+        assert_eq!(compacted, expected_compacted);
+    }
+
+    #[test]
+    fn test_lsb_bit_packer_across_bytes() {
+        let mut packer = LSBBitPacker::new();
+        // Write 5 bits, leaving 3 bits in the current byte
+        packer.push_bits(0b11010, 5);
+        assert_eq!(packer.into_vec(), vec![0b00011010]);
+
+        // Write another 5 bits, which will span across two bytes
+        let mut packer = LSBBitPacker::new();
+        packer.push_bits(0b11010, 5);
+        packer.push_bits(0b01110, 5);
+        assert_eq!(packer.into_vec(), vec![0b11011010, 0b00000001]);
+
+        // Write 15 bits, spanning multiple bytes
+        let mut packer = LSBBitPacker::new();
+        packer.push_bits(0b101010101010101, 15);
+        assert_eq!(packer.into_vec(), vec![0b01010101, 0b01010101]);
+    }
+
+    #[test]
+    fn test_lsb_bit_packer_and_iterator_roundtrip() {
+        let mut packer = LSBBitPacker::new();
+        let test_cases = [(0b11010, 5), (0b01110, 5), (0b101010101010101, 15)];
+
+        for &(bits, len) in &test_cases {
+            packer.push_bits(bits, len);
+        }
+
+        let data = packer.into_vec();
+        let mut iterator = LSBBitsIterator::new(&data);
+
+        for &(bits, len) in &test_cases {
+            assert_eq!(iterator.pop_bits(len), Some(bits as u16));
+        }
+    }
+
+    #[test]
+    fn test_huffman_code_length_limit() {
+        // This test creates a highly skewed frequency distribution to provoke
+        // long Huffman codes.
+        let mut text = vec![];
+        for i in 0..30 {
+            for _ in 0..i + 1 {
+                text.push(i as u8);
+            }
+        }
+
+        let symbols: Vec<u16> = text.iter().map(|&b| b as u16).collect();
+        let encoding =
+            canonical_huffman_encoding_from_cleartext(&symbols, RFC_1951_MAX_LIT_CODE_LEN).unwrap();
+
+        for enc in &encoding {
+            assert!(
+                enc.len <= RFC_1951_MAX_LIT_CODE_LEN,
+                "Code length {} for symbol {} exceeds the limit of {}",
+                enc.len,
+                enc.symbol,
+                RFC_1951_MAX_LIT_CODE_LEN
             );
         }
     }

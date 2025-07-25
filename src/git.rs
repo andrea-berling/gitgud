@@ -117,7 +117,7 @@ fn write_object(payload: &[u8], git_dir_path: &Path) -> anyhow::Result<()> {
     let mut stream = zlib::Stream::new(
         zlib::CompressionMethod::DEFLATE(2 << 7),
         None,
-        zlib::CompressionLevel::Lowest,
+        zlib::CompressionLevel::Low,
         payload.to_vec(),
     );
     let compressed_payload = stream
