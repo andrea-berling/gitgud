@@ -1,3 +1,4 @@
+#![allow(clippy::incompatible_msrv)]
 use anyhow::ensure;
 
 #[inline]

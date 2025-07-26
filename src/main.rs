@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use anyhow::Context;
-use anyhow::Ok;
 use clap::{Parser, Subcommand};
 use git::FromSha1Hex;
 use git::HasPayload;
@@ -14,10 +13,12 @@ use pack_objects::PackedObjectsStream;
 use sha1::hex_encode;
 
 mod git;
+mod http;
 mod pack_objects;
 mod pkt_line;
 mod sha1;
 mod sideband;
+mod smart_http;
 mod zlib;
 
 #[derive(Parser, Debug)]
@@ -69,6 +70,13 @@ enum Command {
         #[arg(short = 'm')]
         message: String,
     },
+    /// Clone a repository to the given directory
+    Clone {
+        /// HTTP(S) url to the repo
+        repo_url: String,
+        /// The directory to clone the repo to
+        directory: Option<String>,
+    },
     /// Print zlib metadata from a file
     ZlibMetadata {
         /// The file to read
@@ -106,13 +114,9 @@ fn main() -> anyhow::Result<()> {
 
     let git_dir = PathBuf::from(git::GIT_DIRECTORY_NAME);
 
-    match &cli.command {
+    match cli.command {
         Command::Init => {
-            fs::create_dir(&git_dir).context("creating .git directory")?;
-            fs::create_dir(git_dir.join("objects")).context("creating objects directory")?;
-            fs::create_dir(git_dir.join("refs")).context("creating refs directory")?;
-            fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
-                .context("writing to HEAD file")?;
+            git::init(".").context("initializing the current directory as a repository")?;
             println!("Initialized git directory");
             Ok(())
         }
@@ -123,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             if !pretty_print {
                 bail!("cat-file currently only supports the -p option");
             }
-            let blob = git::Blob::from_sha1_hex(object, &git_dir)
+            let blob = git::Blob::from_sha1_hex(&object, &git_dir)
                 .context(format!("making a blob from {object}"))?;
             stdout().write_all(blob.bytes())?;
             stdout().flush()?;
@@ -148,7 +152,7 @@ fn main() -> anyhow::Result<()> {
                 bail!("ls-tree currently only supports the --name-only option");
             }
 
-            let tree = git::Tree::from_sha1_hex(tree_sha, &git_dir)
+            let tree = git::Tree::from_sha1_hex(&tree_sha, &git_dir)
                 .context(format!("fetching tree for {tree_sha}"))?;
             for entry in tree.entries() {
                 println!("{}", entry.name());
@@ -156,14 +160,14 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::ZlibMetadata { file } => {
-            let bytes = fs::read(file).context(format!("reading from {file}",))?;
+            let bytes = fs::read(&file).context(format!("reading from {file}",))?;
             let stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             print!("{stream}");
             Ok(())
         }
         Command::ZlibInflate { file } => {
-            let bytes = fs::read(file).context(format!("reading from {file}",))?;
+            let bytes = fs::read(&file).context(format!("reading from {file}",))?;
             let mut stream: zlib::Stream =
                 bytes.as_slice().try_into().context("decoding read bytes")?;
             stdout().write_all(stream.inflate()?)?;
@@ -185,10 +189,10 @@ fn main() -> anyhow::Result<()> {
             message,
         } => {
             let commit_object = git::Commit::new_no_author_no_committer(
-                sha1::hex_decode(tree_sha)
+                sha1::hex_decode(&tree_sha)
                     .context(format!("decoding {tree_sha} into a SHA1 digest"))?,
                 if let Some(parent) = parent {
-                    vec![sha1::hex_decode(parent)
+                    vec![sha1::hex_decode(&parent)
                         .context(format!("decoding {parent} into a SHA1 digest"))?]
                 } else {
                     vec![]
@@ -205,7 +209,7 @@ fn main() -> anyhow::Result<()> {
         Command::ListPack { file } => {
             let bytes = std::fs::read(file).context("reading pack file")?;
             let mut object_stream: PackedObjectsStream =
-                bytes[8..].try_into().context("parsing pack file")?;
+                bytes.as_slice().try_into().context("parsing pack file")?;
             for object in &mut object_stream {
                 println!("{:#?}", object.context("checking the unpacked object")?);
             }
@@ -214,51 +218,85 @@ fn main() -> anyhow::Result<()> {
         Command::UnpackObjects { file } => {
             let bytes = std::fs::read(file).context("reading pack file")?;
             let mut object_stream: PackedObjectsStream =
-                bytes[8..].try_into().context("parsing pack file")?;
-            let mut unresolved = vec![];
-            for object in &mut object_stream {
-                match object.context("failed to unpack object")? {
-                    pack_objects::PackedObject::Object(object) => {
-                        object
-                            .serialize(None, &git_dir)
-                            .context("failed to serialize object")?;
-                    }
-                    pack_objects::PackedObject::RefDelta(ref_delta) => {
-                        let ref_delta_clone = ref_delta.clone();
-                        if !pack_objects::PackedObject::from(ref_delta)
-                            .serialize(&git_dir)
-                            .context("failed to serialize ref delta object")?
-                        {
-                            // This is a temporary workaround for efficiency, will be revisited later
-                            unresolved.push(ref_delta_clone);
-                            continue;
-                        }
-                    }
-                }
-            }
-            while let Some(ref_delta) = unresolved.pop() {
-                let ref_delta_clone = ref_delta.clone();
-                if !pack_objects::PackedObject::from(ref_delta)
-                    .serialize(&git_dir)
-                    .context("failed to serialize unresolved ref delta object")?
-                {
-                    // This is a temporary workaround for efficiency, will be revisited later
-                    unresolved.push(ref_delta_clone);
-                    continue;
-                }
-            }
-            Ok(())
+                bytes.as_slice().try_into().context("parsing pack file")?;
+            object_stream
+                .unpack_all(&git_dir)
+                .context(format!("unpacking all objects into {git_dir:?}"))
         }
         Command::ZlibDeflate { file, level } => {
             let mut stream = zlib::Stream::new(
                 zlib::CompressionMethod::DEFLATE(2 << 7),
                 None,
                 level.unwrap_or(zlib::CompressionLevel::Lowest),
-                std::fs::read(file).context(format!("reading file {}", file))?,
+                std::fs::read(&file).context(format!("reading file {file}",))?,
             );
-            stdout()
-                .write_all(stream.deflate().context("deflating stream")?)?;
-            stdout().flush().context("flushing stdout")?;
+            stdout().write_all(stream.deflate().context("deflating stream")?)?;
+            stdout().flush().context("flushing stdout")
+        }
+        Command::Clone {
+            repo_url,
+            directory,
+        } => {
+            let directory = directory.unwrap_or({
+                let mut components_it = repo_url.rsplit("/");
+                let Some(component) = components_it.next() else {
+                    bail!("URL is malformed: couldn't extract a directory name from it");
+                };
+                component
+                    .strip_suffix(".git")
+                    .unwrap_or(component)
+                    .to_string()
+            });
+            let mut smart_http_client = smart_http::Client::new_from_url(&repo_url)
+                .context("making a smart HTTP client form the given URL")?;
+            let refs_info = smart_http_client
+                .fetch_refs_info()
+                .context("fetching information about refs from the repo URL")?;
+            let head_ref_packfile = smart_http_client
+                .fetch_ref_packfile(refs_info.head_sha())
+                .context("fetching the packfile for the repository head from the repo URL")?;
+            std::fs::create_dir(&directory).context("creating the repo directory")?;
+            git::init(&directory).context("initilaizing the repo directory")?;
+
+            let mut object_stream: PackedObjectsStream = head_ref_packfile
+                .as_slice()
+                .try_into()
+                .context("parsing pack file")?;
+
+            let git_dir = PathBuf::from_iter([directory.clone(), ".git".to_string()]);
+
+            object_stream
+                .unpack_all(&git_dir)
+                .context(format!("unpacking all objects to {git_dir:?}"))?;
+
+            fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: {}\n", refs_info.head_ref()),
+            )
+            .context("writing to HEAD file")?;
+            let ref_name = refs_info
+                .head_ref()
+                .rsplit("/")
+                .next()
+                .ok_or(anyhow::anyhow!(
+                    "the ref name must be a / separated string (e.g. refs/heads/master)"
+                ))?;
+            fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: {}\n", refs_info.head_ref()),
+            )
+            .context("writing to HEAD file")?;
+            fs::write(
+                git_dir.join("refs").join("heads").join(ref_name),
+                refs_info.head_sha(),
+            )
+            .context(format!("creating ref file for {ref_name}"))?;
+
+            git::checkout_empty(refs_info.head_sha(), &PathBuf::from(directory), &git_dir)
+                .context(format!(
+                    "checking out commit {} in empty repository",
+                    refs_info.head_sha()
+                ))?;
             Ok(())
         }
     }

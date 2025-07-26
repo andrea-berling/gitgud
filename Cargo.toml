@@ -9,4 +9,6 @@ rust-version = "1.80"
 anyhow = "1.0.68"                                # error handling
 clap = { version = "4.5.41", features = ["derive"] }
 faccess = "0.2.4"
+rustls = "0.23.29"
 thiserror = "1.0.38"                             # error handling
+webpki-roots = "1.0.2"

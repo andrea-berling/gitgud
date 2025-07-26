@@ -7,8 +7,8 @@ enum Channel {
 }
 
 struct PackData<'a> {
-    payload: &'a [u8],
-    channel: Channel,
+    _payload: &'a [u8],
+    _channel: Channel,
 }
 
 impl<'a> TryFrom<&'a [u8]> for PackData<'a> {
@@ -16,8 +16,8 @@ impl<'a> TryFrom<&'a [u8]> for PackData<'a> {
 
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
         Ok(Self {
-            payload: bytes.get(1..).ok_or(anyhow::anyhow!("no payload bytes"))?,
-            channel: match bytes
+            _payload: bytes.get(1..).ok_or(anyhow::anyhow!("no payload bytes"))?,
+            _channel: match bytes
                 .first()
                 .ok_or(anyhow::anyhow!("not enough bytes to identify channel"))?
             {

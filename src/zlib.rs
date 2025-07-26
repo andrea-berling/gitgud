@@ -174,9 +174,6 @@ impl TryFrom<&[u8]> for Stream {
         let compressed_data_offset = 2 + usize::from(has_preset_dictionary) * 4;
         let preset_dictionary = if has_preset_dictionary {
             bail!("preset dictionaries are not supported yet");
-            // We need 4 more bytes for DICTID
-            ensure!(bytes.len() > 6, "not enough bytes to parse DICTID");
-            Some(bytes[2..2 + 4].try_into()?)
         } else {
             None
         };
@@ -365,6 +362,7 @@ impl LSBBitPacker {
         }
     }
 
+    #[allow(unused)]
     fn push_bit(&mut self, bit: u8) {
         if self.bits_written_so_far % 8 == 0 {
             self.buffer.push(0);
@@ -398,26 +396,6 @@ impl LSBBitPacker {
     #[inline]
     fn push_reversed_bits(&mut self, bits: u64, n_bits: usize) {
         self.push_bits(bits.reverse_bits() >> (u64::BITS as usize - n_bits), n_bits);
-    }
-
-    fn bit_cursor(&self) -> usize {
-        self.bits_written_so_far
-    }
-
-    fn align_to_next_byte_if_unaligned(&mut self) {
-        if self.bits_written_so_far % 8 == 0 {
-            self.bits_written_so_far = (self.bits_written_so_far + 8) / 8;
-        }
-    }
-
-    fn push_byte_aligned_u16_le(&mut self, val: u16) -> bool {
-        if self.bits_written_so_far % 8 != 0 {
-            return false;
-        }
-
-        self.align_to_next_byte_if_unaligned();
-        self.buffer.extend(val.to_le_bytes());
-        true
     }
 
     fn into_vec(self) -> Vec<u8> {
@@ -659,6 +637,7 @@ fn get_decoders_from_encoded_lengths(
     ))
 }
 
+#[allow(unused)]
 fn huffman_codes_lengths_from_huffman_tree(
     tree: &[HuffmanNode],
     root_idx: u16,
@@ -699,6 +678,7 @@ struct MergePackage {
     symbols_and_freqs: Vec<(u16, usize)>,
 }
 
+#[allow(unused)]
 /// Naive, no bound length huffman tree building algorithm
 fn naive_canonical_huffman_encoding_from_cleartext(
     bytes: &[u16],
@@ -751,8 +731,6 @@ fn naive_canonical_huffman_encoding_from_cleartext(
             huffman_tree.len() - 1,
         )));
     }
-
-    // eprintln!("{}", to_graphviz(&huffman_tree, root_idx));
 
     let mut huffman_encoding = huffman_codes_lengths_from_huffman_tree(&huffman_tree, root_idx, 0)
         .context("computing huffman codes lengths")?;
@@ -850,6 +828,7 @@ fn canonical_huffman_encoding_from_cleartext(
     Ok(huffman_encoding)
 }
 
+#[allow(unused)]
 fn to_graphviz(huffman_tree: &[HuffmanNode], root_idx: u16) -> String {
     let mut ret = String::new();
     writeln!(&mut ret, "digraph G {{").unwrap();
@@ -943,8 +922,6 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
         bail!("empty stream of bytes not supported yet")
     }
     let mut result = vec![];
-    // TODO: a system to cleverly divide the input into blocks, select the appropriate compression
-    // method for each block, and use that
     match level {
         CompressionLevel::Lowest => {
             ensure!(bytes.len() < u16::MAX as usize);
@@ -967,19 +944,16 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             let main_huffman_encoding =
                 canonical_huffman_encoding_from_cleartext(&symbols, RFC_1951_MAX_LIT_CODE_LEN)
                     .context("computing huffman code lengths for the bytes")?;
-            //eprintln!("main_huffman_encoding = {main_huffman_encoding:#?}");
             let mut lengths_to_encode = vec![0; 258];
             for &EncodedSymbol { symbol, len } in &main_huffman_encoding {
                 lengths_to_encode[symbol as usize] = len;
             }
-            // eprintln!("lengths_to_encode = {lengths_to_encode:?}");
             let hlit = 0;
             let hdist = 0;
             let (compact_code_lengths, code_lengths_huffman_encoding) =
                 code_lengths_encoding_code_lengths(&lengths_to_encode)
                     .context("computing the length of codes used to encode code lengths")?;
             let mut hclen_array = vec![0; CODE_LENGTHS_SYMBOL_MAP.len()];
-            //eprintln!("code_lenghts_huffman_encoding = {code_lengths_huffman_encoding:#?}");
             for &EncodedSymbol { symbol, len } in &code_lengths_huffman_encoding {
                 // These lengths are packed in the sequence given by CODE_LENGTHS_SYMBOL_MAP
                 hclen_array[CODE_LENGTHS_INVERSE_SYMBOL_MAP[symbol as usize] as usize] = len;
@@ -991,8 +965,6 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
                 .context("hclen_array should not be empty")?
                 + 1;
             hclen_array.truncate(hclen_array_end);
-
-            // eprintln!("compact_code_lengths = {compact_code_lengths:#?}");
 
             let hclen = hclen_array.len() - 4;
 
@@ -1012,7 +984,6 @@ fn deflate(bytes: &[u8], level: CompressionLevel) -> anyhow::Result<Vec<u8>> {
             for &len in &hclen_array {
                 bit_packer.push_bits(len as u64, 3);
             }
-            // eprintln!("compact codes: {}", compact_code_lengths.len());
             for &encoded_code_len in &compact_code_lengths {
                 encoded_code_len
                     .compress(&mut bit_packer, &code_lengths_compressor)
@@ -1143,13 +1114,15 @@ fn code_lengths_encoding_code_lengths(
                                 .context("trying to fit a code length into a u8")?,
                         ),
                         EncodedLength::RepeatPrevious(
-                            u8::try_from(chunk.len()).context("chunk length does not fit in u8")? - 1,
+                            u8::try_from(chunk.len()).context("chunk length does not fit in u8")?
+                                - 1,
                         ),
                     ]);
                 } else {
                     for &len in chunk {
-                        compact_huffman_code_lengths
-                            .push(EncodedLength::Literal(u8::try_from(len).context("code length does not fit in u8")?));
+                        compact_huffman_code_lengths.push(EncodedLength::Literal(
+                            u8::try_from(len).context("code length does not fit in u8")?,
+                        ));
                     }
                 }
             }
@@ -1158,23 +1131,31 @@ fn code_lengths_encoding_code_lengths(
             for chunk in length_run.chunks(138) {
                 if chunk.len() >= 11 {
                     compact_huffman_code_lengths.push(EncodedLength::RepeatLongSequenceOfZeros(
-                        chunk.len().try_into().context("chunk length does not fit in u8")?,
+                        chunk
+                            .len()
+                            .try_into()
+                            .context("chunk length does not fit in u8")?,
                     ));
                 } else if chunk.len() >= 3 {
                     compact_huffman_code_lengths.push(EncodedLength::RepeatShortSequenceOfZeros(
-                        chunk.len().try_into().context("chunk length does not fit in u8")?,
+                        chunk
+                            .len()
+                            .try_into()
+                            .context("chunk length does not fit in u8")?,
                     ));
                 } else {
                     for &len in chunk {
-                        compact_huffman_code_lengths
-                            .push(EncodedLength::Literal(len.try_into().context("TODO")?));
+                        compact_huffman_code_lengths.push(EncodedLength::Literal(
+                            len.try_into().context("code length does not fit in u8")?,
+                        ));
                     }
                 }
             }
         } else {
             for &len in length_run {
-                compact_huffman_code_lengths
-                    .push(EncodedLength::Literal(len.try_into().context("TODO")?));
+                compact_huffman_code_lengths.push(EncodedLength::Literal(
+                    len.try_into().context("code length does not fit in u8")?,
+                ));
             }
         }
     }
@@ -1183,19 +1164,6 @@ fn code_lengths_encoding_code_lengths(
         .iter()
         .map(|code_length| code_length.to_code() as u16)
         .collect();
-    let total_len = compact_huffman_code_lengths
-        .iter()
-        .fold(0usize, |acc, encoded_length| {
-            acc + match encoded_length {
-                EncodedLength::Literal(_) => 1,
-                &(EncodedLength::RepeatPrevious(count)
-                | EncodedLength::RepeatShortSequenceOfZeros(count)
-                | EncodedLength::RepeatLongSequenceOfZeros(count)) => count,
-            } as usize
-        });
-    // eprintln!(
-    //     "compact_huffman_code_lengths (len: {total_len}) = {compact_huffman_code_lengths:#?}"
-    // );
     Ok((
         compact_huffman_code_lengths,
         canonical_huffman_encoding_from_cleartext(
@@ -1538,7 +1506,6 @@ fn n_extra_bits_for_distance_code(code: u16) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep_ms;
 
     use super::*;
 
@@ -1821,7 +1788,6 @@ exec zig-out/bin/main "$@""#;
         // 'l' should have a short code length.
         // 'h', 'e', ' ', 'w', 'r', 'd' should have longer code lengths.
         // 'o' should have a medium code length.
-        //dbg!(&encoding);
         let l_len = encoding_map[&(b'l' as u16)];
         let o_len = encoding_map[&(b'o' as u16)];
         let h_len = encoding_map[&(b'h' as u16)];

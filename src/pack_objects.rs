@@ -1,3 +1,4 @@
+#![allow(clippy::incompatible_msrv)]
 use std::{
     cmp::min,
     fmt::Debug,
@@ -95,7 +96,45 @@ pub struct PackedObjectsStream<'a> {
     bytes: BytesBuffer<'a>,
     n_objects: usize,
     objects_parsed: usize,
-    version: PackVersion,
+    _version: PackVersion,
+}
+
+impl<'a> PackedObjectsStream<'a> {
+    pub fn unpack_all(&mut self, git_dir: &Path) -> anyhow::Result<()> {
+        let mut unresolved = vec![];
+        for object in self {
+            match object.context("failed to unpack object")? {
+                PackedObject::Object(object) => {
+                    object
+                        .serialize(None, git_dir)
+                        .context("failed to serialize object")?;
+                }
+                PackedObject::RefDelta(ref_delta) => {
+                    let ref_delta_clone = ref_delta.clone();
+                    if !PackedObject::from(ref_delta)
+                        .serialize(git_dir)
+                        .context("failed to serialize ref delta object")?
+                    {
+                        // This is a temporary workaround for efficiency, will be revisited later
+                        unresolved.push(ref_delta_clone);
+                        continue;
+                    }
+                }
+            }
+        }
+        while let Some(ref_delta) = unresolved.pop() {
+            let ref_delta_clone = ref_delta.clone();
+            if !PackedObject::from(ref_delta)
+                .serialize(git_dir)
+                .context("failed to serialize unresolved ref delta object")?
+            {
+                // This is a temporary workaround for efficiency, will be revisited later
+                unresolved.push(ref_delta_clone);
+                continue;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Deref for PackedObjectsStream<'a> {
@@ -149,7 +188,7 @@ impl<'a> TryFrom<&'a [u8]> for PackedObjectsStream<'a> {
             bytes,
             n_objects,
             objects_parsed: 0,
-            version,
+            _version: version,
         })
     }
 }

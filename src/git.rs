@@ -1,7 +1,11 @@
+#![allow(clippy::incompatible_msrv)]
 use core::fmt::Debug;
 use std::{
     cmp::min,
-    fs::{self},
+    collections::VecDeque,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{symlink, OpenOptionsExt as _},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -781,7 +785,7 @@ impl Deserialize for Commit {
             bail!("no header end marker (\x00 byte) found")
         };
         let len: usize = str::from_utf8(
-            &bytes
+            bytes
                 .get(COMMIT_HEADER_KEYWORD.len() + 1..header_end_marker)
                 .ok_or(anyhow::anyhow!("not enough bytes to get the header length"))?,
         )
@@ -925,7 +929,7 @@ pub enum Object {
 }
 
 impl Object {
-    fn digest(&self) -> sha1::Digest {
+    pub fn digest(&self) -> sha1::Digest {
         match self {
             Object::Blob(blob) => blob.digest(),
             Object::Tree(tree) => tree.digest(),
@@ -1015,4 +1019,76 @@ impl HasPayload for Object {
             Object::Commit(commit) => commit.payload(),
         }
     }
+}
+
+pub fn init(directory: &str) -> anyhow::Result<()> {
+    let git_dir = PathBuf::from_iter([directory, GIT_DIRECTORY_NAME]);
+
+    fs::create_dir(&git_dir).context("creating .git directory")?;
+    fs::create_dir(git_dir.join("objects")).context("creating objects directory")?;
+    fs::create_dir(git_dir.join("refs")).context("creating refs directory")?;
+    fs::create_dir(git_dir.join("refs").join("heads")).context("creating heads directory")?;
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").context("writing to HEAD file")?;
+    Ok(())
+}
+
+pub fn checkout_empty(
+    commit: &str,
+    workdir_path: &Path,
+    git_dir_path: &Path,
+) -> anyhow::Result<()> {
+    let commit = Commit::from_sha1_hex(commit, git_dir_path).context(format!(
+        "retrieving commit {commit} from the {git_dir_path:?} directory"
+    ))?;
+    let mut objects_to_checkout =
+        VecDeque::from([(hex_encode(&commit.tree), workdir_path.to_owned(), None)]);
+    while let Some((sha, path, mode)) = objects_to_checkout.pop_front() {
+        match Object::from_sha1_hex(&sha, git_dir_path)
+            .context(format!("deserializing object {sha}"))?
+        {
+            Object::Blob(blob) => {
+                let mode = mode.ok_or(anyhow::anyhow!(
+                    "blob must have a mode defined for checkout"
+                ))?;
+                let mut open_options = OpenOptions::new();
+                open_options.write(true).create(true);
+                match mode {
+                    TreeEntryMode::Regular => {}
+                    TreeEntryMode::Executable => {
+                        open_options.mode(0o755);
+                    }
+                    TreeEntryMode::SymbolicLink => {
+                        symlink(
+                            String::from_utf8(blob.bytes.to_vec())
+                                .context("converting contents of symbolic link into a string")?,
+                            path,
+                        )
+                        .context("creating symbolic link")?;
+                        return Ok(());
+                    }
+                    TreeEntryMode::Directory => unreachable!(),
+                }
+                let mut file = open_options
+                    .open(&path)
+                    .context(format!("creating file {path:?}"))?;
+                file.write_all(&blob.bytes)
+                    .context("writing blob contents to file")?;
+            }
+            Object::Tree(tree) => {
+                if !path.exists() {
+                    // this literally only trips on the root dir
+                    std::fs::create_dir(&path).context(format!("creating directory {path:?}"))?;
+                }
+                objects_to_checkout.extend(tree.entries.iter().map(|tree_entry| {
+                    (
+                        hex_encode(&tree_entry.sha1),
+                        path.join(&tree_entry.name),
+                        Some(tree_entry.mode),
+                    )
+                }));
+            }
+            Object::Commit(..) => unreachable!(),
+        }
+    }
+    Ok(())
 }

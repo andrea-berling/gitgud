@@ -1,21 +1,39 @@
+use std::io::Write;
+
 use anyhow::{Context, Ok};
 
-struct PktLines<'a> {
+pub struct PktLines<'a> {
     bytes: &'a [u8],
     byte_cursor: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Packet<'a> {
+pub enum Packet<'a> {
     Data(&'a [u8]),
     Flush,
     Delim,
     ResponseEnd,
 }
 
+impl<'a> Packet<'a> {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Packet::Data(items) => {
+                let mut output: Vec<u8> = vec![];
+                write!(&mut output, "{:04x}", items.len() + 4).unwrap();
+                output.write_all(items).unwrap();
+                output
+            }
+            Packet::Flush => b"0000".to_vec(),
+            Packet::Delim => b"0001".to_vec(),
+            Packet::ResponseEnd => b"0002".to_vec(),
+        }
+    }
+}
+
 /// Iterator over the pktlines packet encoded in a bytes buffer
 impl<'a> PktLines<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
             byte_cursor: 0,
