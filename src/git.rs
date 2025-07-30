@@ -755,7 +755,6 @@ impl HasPayload for Commit {
         }
         payload.push(b'\n');
         payload.extend(self.message.bytes());
-        payload.push(b'\n');
 
         object_bytes.extend(payload.len().to_string().as_bytes());
         object_bytes.push(b'\x00');
@@ -888,7 +887,7 @@ impl Deserialize for Commit {
                 "missing space after parent header"
             );
             byte_cursor += 1;
-            let mut end_marker = byte_cursor + 1;
+            let mut end_marker = byte_cursor;
             while bytes
                 .get(end_marker..end_marker + 2)
                 .ok_or(anyhow::anyhow!("not enough bytes to parse gpg signature"))?
@@ -907,9 +906,8 @@ impl Deserialize for Commit {
             "missing newline before message"
         );
         byte_cursor += 1;
-        let message = str::from_utf8(&bytes[byte_cursor..len + header_end_marker])
+        let message = str::from_utf8(&bytes[byte_cursor..len + header_end_marker + 1])
             .context("message is not valid UTF-8")?;
-        //ensure!(bytes[len] == b'\n', "missing newline after message");
         Ok(Self {
             tree: tree_sha,
             parents,
