@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use git::Deserialize as _;
 use git::FromSha1Hex;
 use git::HasPayload;
 use git::SerializeToGitObject;
@@ -103,6 +104,14 @@ enum Command {
     UnpackObjects {
         /// The pack file to unpack
         file: String,
+    },
+    /// Parse the index file, re-serialize it and print it back to stdout. It will ignore any
+    /// extensions and will only work with index version 2
+    PrintIndex {
+        /// Print a pretty version of the existing index. It will include a list of all entries
+        /// with their attributes as rust structs, but will skip over the extensions.
+        #[arg(short = 'p')]
+        pretty: bool,
     },
 }
 
@@ -292,11 +301,54 @@ fn main() -> anyhow::Result<()> {
             )
             .context(format!("creating ref file for {ref_name}"))?;
 
+            let remotes_path = git_dir.join("refs/remotes/origin");
+            std::fs::create_dir_all(&remotes_path).context("creating the remotes directory")?;
+            std::fs::write(remotes_path.join(ref_name), refs_info.head_sha())
+                .context(format!("creating remote ref file for {ref_name}"))?;
+            fs::write(
+                remotes_path.join("HEAD"),
+                format!("ref: refs/remotes/heads/{ref_name}\n"),
+            )
+            .context("writing to remote HEAD file")?;
+
+            fs::write(
+                git_dir.join("config"),
+                format!(
+                    r#"[core]
+        repositoryformatversion = 0
+        filemode = true
+        bare = false
+        logallrefupdates = true
+[remote "origin"]
+        url = {repo_url}
+        fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "{ref_name}"]
+        remote = origin
+        merge = refs/heads/{ref_name}"#
+                ),
+            )
+            .context("writing git config file")?;
+
             git::checkout_empty(refs_info.head_sha(), &PathBuf::from(directory), &git_dir)
                 .context(format!(
                     "checking out commit {} in empty repository",
                     refs_info.head_sha()
                 ))?;
+            Ok(())
+        }
+        Command::PrintIndex { pretty } => {
+            let mut index: git::Index = git::Index::deserialize(
+                &std::fs::read(git_dir.join("index")).context("reading from the index file")?,
+            )
+            .context("parsing bytes into index")?;
+            if pretty {
+                println!("{index:#?}");
+            } else {
+                stdout().write_all(&git::Index::serialize(&mut index))?;
+                stdout().write_all(&git::Index::serialize(&mut index))?;
+                stdout().flush()?;
+                stdout().flush()?;
+            }
             Ok(())
         }
     }

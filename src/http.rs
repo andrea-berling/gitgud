@@ -146,10 +146,10 @@ impl<'a> HttpResponseReader<'a> {
         };
 
         Ok(Response {
-            status,
-            headers,
+            _status: status,
+            _headers: headers,
             body,
-            chunked,
+            _chunked: chunked,
         })
     }
 }
@@ -500,27 +500,14 @@ pub enum Status {
 
 #[derive(Debug)]
 pub struct Response {
-    status: Status,
-    headers: HashMap<String, String>,
+    _status: Status,
+    _headers: HashMap<String, String>,
     body: Option<Vec<u8>>,
-    chunked: bool,
+    _chunked: bool,
 }
 
 impl Response {
     pub fn body(&self) -> Option<&Vec<u8>> {
         self.body.as_ref()
     }
-
-    pub fn status(&self) -> Status {
-        self.status
-    }
-
-    pub fn headers(&self) -> &HashMap<String, String> {
-        &self.headers
-    }
-
-    pub fn chunked(&self) -> bool {
-        self.chunked
-    }
 }
-
