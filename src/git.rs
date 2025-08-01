@@ -1050,9 +1050,30 @@ pub fn checkout_empty(
     let commit = Commit::from_sha1_hex(commit, git_dir_path).context(format!(
         "retrieving commit {commit} from the {git_dir_path:?} directory"
     ))?;
-    let mut objects_to_checkout =
-        VecDeque::from([(hex_encode(&commit.tree), workdir_path.to_owned(), None)]);
+    let files_to_index = checkout_tree(&hex_encode(&commit.tree), workdir_path, git_dir_path)?;
+
     let mut index = Index::new_empty_v2();
+    for (sha, full_path) in files_to_index {
+        let relative_path = full_path.strip_prefix(workdir_path).with_context(|| {
+            format!("could not strip prefix {workdir_path:?} from {full_path:?}")
+        })?;
+        index.add_entry(
+            IndexEntry::try_from_path_and_id(full_path.as_path(), relative_path, sha)
+                .context(format!("creating index entry for {relative_path:?}"))?,
+        );
+    }
+    fs::write(git_dir_path.join("index"), Index::serialize(&mut index))
+        .context("writing to index file")?;
+    Ok(())
+}
+
+fn checkout_tree(
+    tree_sha: &str,
+    workdir_path: &Path,
+    git_dir_path: &Path,
+) -> anyhow::Result<Vec<(sha1::Digest, PathBuf)>> {
+    let mut objects_to_checkout =
+        VecDeque::from([(tree_sha.to_string(), workdir_path.to_owned(), None)]);
     let mut files_to_index = vec![];
     while let Some((sha, path, mode)) = objects_to_checkout.pop_front() {
         match Object::from_sha1_hex(&sha, git_dir_path)
@@ -1108,19 +1129,7 @@ pub fn checkout_empty(
             Object::Commit(..) => unreachable!(),
         }
     }
-
-    for (sha, full_path) in files_to_index {
-        let relative_path = full_path.strip_prefix(workdir_path).with_context(|| {
-            format!("could not strip prefix {workdir_path:?} from {full_path:?}")
-        })?;
-        index.add_entry(
-            IndexEntry::try_from_path_and_id(full_path.as_path(), relative_path, sha)
-                .context(format!("creating index entry for {relative_path:?}"))?,
-        );
-    }
-    fs::write(git_dir_path.join("index"), Index::serialize(&mut index))
-        .context("writing to index file")?;
-    Ok(())
+    Ok(files_to_index)
 }
 
 impl HasPayload for Index {

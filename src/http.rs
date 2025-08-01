@@ -228,83 +228,13 @@ impl TryFrom<&[u8]> for Scheme {
     type Error = anyhow::Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        ensure!(bytes.starts_with(b"http"));
-        let mut cursor = b"http".len();
-        match bytes.get(cursor).ok_or(anyhow::anyhow!(
-            "not enough bytes to parse a scheme: expected s or :"
-        ))? {
-            b':' => {
-                cursor += 1;
-                ensure!(
-                    bytes.get(cursor..cursor + 2).ok_or(anyhow::anyhow!(
-                        "not enough bytes to parse a scheme: expected //"
-                    ))? == b"//",
-                    "expected //"
-                );
-                Ok(Self::HTTP)
-            }
-            b's' => {
-                cursor += 1;
-                ensure!(
-                    bytes.get(cursor..cursor + 3).ok_or(anyhow::anyhow!(
-                        "not enough bytes to parse a scheme: expected :// after https"
-                    ))? == b"://",
-                    "expected ://"
-                );
-                Ok(Self::HTTPS)
-            }
-            b => bail!("unexpected byte after http: {b:#x}"),
+        if bytes.starts_with(b"https://") {
+            Ok(Self::HTTPS)
+        } else if bytes.starts_with(b"http://") {
+            Ok(Self::HTTP)
+        } else {
+            bail!("invalid or unsupported scheme in URL");
         }
-    }
-}
-
-struct URLParser<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a, 'b> URLParser<'a> {
-    fn new(bytes: &'b [u8]) -> Self
-    where
-        'b: 'a,
-    {
-        Self { bytes, cursor: 0 }
-    }
-}
-
-impl<'a> URLParser<'a> {
-    fn parse_scheme(&mut self) -> anyhow::Result<Scheme> {
-        let ret: Scheme = self.bytes[self.cursor..]
-            .try_into()
-            .context("parsing scheme from URL")?;
-        self.cursor += ret.serialization_len();
-        Ok(ret)
-    }
-
-    fn parse_host(&mut self) -> anyhow::Result<&'a [u8]> {
-        let host_len = self.bytes[self.cursor..]
-            .iter()
-            .position(|&c| c == b'/')
-            .unwrap_or(self.bytes.len() - self.cursor);
-        let return_value = &self.bytes[self.cursor..][..host_len];
-        self.cursor += (host_len + 1).min(self.bytes.len() - self.cursor);
-        Ok(return_value)
-    }
-
-    fn parse_path(&mut self) -> anyhow::Result<Vec<&'a [u8]>> {
-        let path_len = self.bytes[self.cursor..]
-            .iter()
-            .position(|&c| c == b'?')
-            .unwrap_or(self.bytes.len() - self.cursor);
-        let mut result = vec![];
-        if self.cursor >= self.bytes.len() {
-            return Ok(result);
-        }
-        for component in self.bytes[self.cursor..][..path_len].split(|&c| c == b'/') {
-            result.push(component);
-        }
-        self.cursor += (path_len + 1).min(self.bytes.len() - self.cursor);
-        Ok(result)
     }
 }
 
@@ -333,19 +263,35 @@ impl TryFrom<&[u8]> for URL {
     type Error = Error;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let mut parser = URLParser::new(value);
+        let scheme = Scheme::try_from(value)?;
+        let rest = &value[scheme.serialization_len()..];
+
+        let (host_and_path, _query) = rest
+            .iter()
+            .position(|&b| b == b'?')
+            .map(|pos| rest.split_at(pos))
+            .unwrap_or((rest, b""));
+
+        let (host, path) = host_and_path
+            .iter()
+            .position(|&b| b == b'/')
+            .map(|pos| host_and_path.split_at(pos))
+            .unwrap_or((host_and_path, b""));
+
+        let path_components = if path.is_empty() {
+            vec![]
+        } else {
+            // path starts with a '/', so we skip it.
+            path[1..]
+                .split(|&c| c == b'/')
+                .map(|s| s.to_vec())
+                .collect()
+        };
+
         Ok(Self {
-            scheme: parser.parse_scheme()?,
-            host: parser
-                .parse_host()
-                .context("parsing host from URL")?
-                .to_vec(),
-            path_components: parser
-                .parse_path()
-                .context("parsing path from URL")?
-                .iter()
-                .map(|slice| slice.to_vec())
-                .collect(),
+            scheme,
+            host: host.to_vec(),
+            path_components,
             query_params: vec![],
         })
     }

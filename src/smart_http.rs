@@ -167,10 +167,7 @@ impl Client {
             *self.url.scheme(),
             vec![],
             self.url.path_components().to_vec(),
-            vec![http::QueryParam::new(
-                b"service".into(),
-                b"git-upload-pack".into(),
-            )],
+            vec![],
         );
 
         request_url
